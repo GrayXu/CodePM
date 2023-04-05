@@ -42,6 +42,7 @@
 
 #include "rtree_map.h"
 
+#include <libpangolin.h>
 
 TOID_DECLARE(struct tree_map_node, RTREE_MAP_TYPE_OFFSET + 1);
 
@@ -70,12 +71,13 @@ rtree_map_create(PMEMobjpool *pop, TOID(struct rtree_map) *map, void *arg)
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		TX_ADD_DIRECT(map);
-		*map = TX_ZNEW(struct rtree_map);
-	} TX_ONABORT {
+	PGL_TX_BEGIN(pop) {
+		*map = (TOID(struct rtree_map))pgl_tx_alloc(
+				sizeof(struct rtree_map),
+				TOID_TYPE_NUM(struct rtree_map));
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -86,15 +88,15 @@ rtree_map_create(PMEMobjpool *pop, TOID(struct rtree_map) *map, void *arg)
 static void
 rtree_map_clear_node(TOID(struct tree_map_node) node)
 {
+	struct tree_map_node *pnode = pgl_tx_open(node.oid);
 	for (unsigned i = 0; i < ALPHABET_SIZE; i++) {
-		rtree_map_clear_node(D_RO(node)->slots[i]);
+		rtree_map_clear_node(pnode->slots[i]);
 	}
 
-	pmemobj_tx_add_range(node.oid, 0,
-			sizeof(struct tree_map_node) + D_RO(node)->key_size);
-	TX_FREE(node);
-}
+	/* why does pmdk add a range that is to be deleted? */
 
+	pgl_tx_free(node.oid);
+}
 
 /*
  * rtree_map_clear -- removes all elements from the map
@@ -103,15 +105,16 @@ int
 rtree_map_clear(PMEMobjpool *pop, TOID(struct rtree_map) map)
 {
 	int ret = 0;
-	TX_BEGIN(pop) {
-		rtree_map_clear_node(D_RO(map)->root);
 
-		TX_ADD_FIELD(map, root);
+	PGL_TX_BEGIN(pop) {
+		struct rtree_map *rmap = pgl_tx_open(map.oid);
 
-		D_RW(map)->root = TOID_NULL(struct tree_map_node);
-	} TX_ONABORT {
+		rtree_map_clear_node(rmap->root);
+
+		rmap->root = TOID_NULL(struct tree_map_node);
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -124,14 +127,14 @@ int
 rtree_map_destroy(PMEMobjpool *pop, TOID(struct rtree_map) *map)
 {
 	int ret = 0;
-	TX_BEGIN(pop) {
+
+	PGL_TX_BEGIN(pop) {
 		rtree_map_clear(pop, *map);
-		TX_ADD_DIRECT(map);
-		TX_FREE(*map);
+		pgl_tx_free(map->oid);
 		*map = TOID_NULL(struct rtree_map);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -145,18 +148,22 @@ rtree_new_node(const unsigned char *key, uint64_t key_size,
 {
 	TOID(struct tree_map_node) node;
 
-	node = TX_ZALLOC(struct tree_map_node,
-			sizeof(struct tree_map_node) + key_size);
+	struct tree_map_node *pnode = pgl_tx_alloc_open(
+			sizeof(struct tree_map_node) + key_size,
+			TOID_TYPE_NUM(struct tree_map_node));
 
-	/*
-	 * !!! Here should be: D_RO(node)->value
-	 * ... because we don't change map
-	 */
-	D_RW(node)->value = value;
-	D_RW(node)->has_value = has_value;
-	D_RW(node)->key_size = key_size;
+	pnode = pgl_tx_add_range(pnode,
+			offsetof(struct tree_map_node, has_value),
+			sizeof(unsigned) + sizeof(PMEMoid) + sizeof(uint64_t)
+			+ key_size);
 
-	memcpy(D_RW(node)->key, key, key_size);
+	pnode->value = value;
+	pnode->has_value = has_value;
+	pnode->key_size = key_size;
+
+	memcpy(pnode->key, key, key_size);
+
+	node = (TOID(struct tree_map_node))pgl_oid(pnode);
 
 	return node;
 }
@@ -167,22 +174,22 @@ static void
 rtree_map_insert_empty(TOID(struct rtree_map) map,
 	const unsigned char *key, uint64_t key_size, PMEMoid value)
 {
-	TX_ADD_FIELD(map, root);
-	D_RW(map)->root = rtree_new_node(key, key_size, value, 1);
+	struct rtree_map *rmap = pgl_tx_open(map.oid);
+	rmap->root = rtree_new_node(key, key_size, value, 1);
 }
 
 /*
  * key_comm_len -- (internal) calculate the len of common part of keys
  */
 static unsigned
-key_comm_len(TOID(struct tree_map_node) node,
+key_comm_len(struct tree_map_node *pnode,
 	const unsigned char *key, uint64_t key_size)
 {
 	unsigned i;
 
 	for (i = 0;
-		i < MIN(key_size, D_RO(node)->key_size) &&
-			key[i] == D_RO(node)->key[i];
+		i < MIN(key_size, pnode->key_size) &&
+			key[i] == pnode->key[i];
 		i++)
 		;
 
@@ -199,51 +206,62 @@ rtree_map_insert_value(TOID(struct tree_map_node) *node,
 	unsigned i;
 
 	if (TOID_IS_NULL(*node)) {
-		TX_ADD_DIRECT(node);
 		*node = rtree_new_node(key, key_size, value, 1);
 		return;
 	}
 
-	i = key_comm_len(*node, key, key_size);
+	struct tree_map_node *pnode = pgl_get(node->oid);
 
-	if (i != D_RO(*node)->key_size) {
+	i = key_comm_len(pnode, key, key_size);
+
+	if (i != pnode->key_size) {
 		/* Node does not exist. Let's add. */
+		struct tree_map_node *porig = pnode;
 		TOID(struct tree_map_node) orig_node = *node;
-		TX_ADD_DIRECT(node);
 
 		if (i != key_size) {
-			*node = rtree_new_node(D_RO(orig_node)->key, i,
-					OID_NULL, 0);
+			*node = rtree_new_node(porig->key, i, OID_NULL, 0);
 		} else {
-			*node = rtree_new_node(D_RO(orig_node)->key, i,
-					value, 1);
+			*node = rtree_new_node(porig->key, i, value, 1);
 		}
 
-		D_RW(*node)->slots[D_RO(orig_node)->key[i]] = orig_node;
+		porig = pgl_tx_add(porig); /* will modify porig data */
+		pnode = pgl_tx_open(node->oid); /* node was re-assigned */
 
-		TX_ADD_FIELD(orig_node, key_size);
-		D_RW(orig_node)->key_size -= i;
+		pnode = pgl_tx_add_range(pnode,
+				offsetof(struct tree_map_node,
+					slots[porig->key[i]]), sizeof(PMEMoid));
+		pnode->slots[porig->key[i]] = orig_node;
 
-		pmemobj_tx_add_range_direct(D_RW(orig_node)->key,
-				D_RO(orig_node)->key_size);
-		memmove(D_RW(orig_node)->key, D_RO(orig_node)->key + i,
-				D_RO(orig_node)->key_size);
+		porig = pgl_tx_add_range(porig,
+				offsetof(struct tree_map_node, key_size),
+				sizeof(uint64_t) + porig->key_size);
+		porig->key_size -= i;
+		memmove(porig->key, porig->key + i, porig->key_size);
 
 		if (i != key_size) {
-			D_RW(*node)->slots[key[i]] =
+			pnode = pgl_tx_add_range(pnode,
+					offsetof(struct tree_map_node,
+						slots[key[i]]),
+					sizeof(PMEMoid));
+			pnode->slots[key[i]] =
 				rtree_new_node(key + i, key_size - i, value, 1);
 		}
+
 		return;
 	}
 
 	if (i == key_size) {
-		if (OID_IS_NULL(D_RO(*node)->value) || D_RO(*node)->has_value) {
-			/* Just replace old value with new */
-			TX_ADD_FIELD(*node, value);
-			TX_ADD_FIELD(*node, has_value);
+		if (OID_IS_NULL(pnode->value) || pnode->has_value) {
+			/* for has_value and value */
+			pnode = pgl_tx_add_range(pnode,
+					offsetof(struct tree_map_node,
+						has_value),
+					sizeof(unsigned) + sizeof(PMEMoid));
 
-			D_RW(*node)->value = value;
-			D_RW(*node)->has_value = 1;
+			/* Just replace old value with new */
+			pnode->value = value;
+			pnode->has_value = 1;
 		} else {
 			/*
 			 *  Ignore. By the fact current value should be
@@ -252,7 +270,10 @@ rtree_map_insert_value(TOID(struct tree_map_node) *node,
 		}
 	} else {
 		/* Recurse deeply */
-		return rtree_map_insert_value(&D_RW(*node)->slots[key[i]],
+		pnode = pgl_tx_add_range(pnode,
+				offsetof(struct tree_map_node, slots[key[i]]),
+				sizeof(PMEMoid));
+		return rtree_map_insert_value(&pnode->slots[key[i]],
 				key + i, key_size - i, value);
 	}
 }
@@ -263,7 +284,10 @@ rtree_map_insert_value(TOID(struct tree_map_node) *node,
 int
 rtree_map_is_empty(PMEMobjpool *pop, TOID(struct rtree_map) map)
 {
-	return TOID_IS_NULL(D_RO(map)->root);
+	struct rtree_map *rmap = pgl_get(map.oid);
+	TOID(struct tree_map_node) root = rmap->root;
+
+	return TOID_IS_NULL(root);
 }
 
 /*
@@ -275,16 +299,17 @@ rtree_map_insert(PMEMobjpool *pop, TOID(struct rtree_map) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
 		if (rtree_map_is_empty(pop, map)) {
 			rtree_map_insert_empty(map, key, key_size, value);
 		} else {
-			rtree_map_insert_value(&D_RW(map)->root,
+			struct rtree_map *rmap = pgl_tx_open(map.oid);
+			rtree_map_insert_value(&rmap->root,
 					key, key_size, value);
 		}
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -301,13 +326,14 @@ rtree_map_insert_new(PMEMobjpool *pop, TOID(struct rtree_map) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		PMEMoid n = pmemobj_tx_alloc(size, type_num);
-		constructor(pop, pmemobj_direct(n), arg);
+	PGL_TX_BEGIN(pop) {
+		void *pn = pgl_tx_alloc_open(size, type_num);
+		PMEMoid n = pgl_oid(pn);
+		constructor(pop, pn, arg);
 		rtree_map_insert(pop, map, key, key_size, n);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -316,15 +342,11 @@ rtree_map_insert_new(PMEMobjpool *pop, TOID(struct rtree_map) map,
  * is_leaf -- (internal) check a node for zero qty of children
  */
 static bool
-is_leaf(TOID(struct tree_map_node) node)
+is_leaf(struct tree_map_node *pnode)
 {
 	unsigned j;
 
-	for (j = 0;
-		j < ALPHABET_SIZE &&
-			TOID_IS_NULL(D_RO(node)->slots[j]);
-		j++)
-		;
+	for (j = 0; j < ALPHABET_SIZE && TOID_IS_NULL(pnode->slots[j]); j++);
 
 	return (j == ALPHABET_SIZE);
 }
@@ -333,12 +355,12 @@ is_leaf(TOID(struct tree_map_node) node)
  * has_only_one_child -- (internal) check a node for qty of children
  */
 static bool
-has_only_one_child(TOID(struct tree_map_node) node, unsigned *child_idx)
+has_only_one_child(struct tree_map_node *pnode, unsigned *child_idx)
 {
 	unsigned j, child_qty;
 
 	for (j = 0, child_qty = 0; j < ALPHABET_SIZE; j++)
-		if (!TOID_IS_NULL(D_RO(node)->slots[j])) {
+		if (!TOID_IS_NULL(pnode->slots[j])) {
 			child_qty++;
 			*child_idx = j;
 		}
@@ -357,32 +379,40 @@ remove_extra_node(TOID(struct tree_map_node) *node)
 
 	/* Our node has child with only one child. */
 	tmp = *node;
-	has_only_one_child(tmp, &child_idx);
-	tmp_child = D_RO(tmp)->slots[child_idx];
+	struct tree_map_node *ptmp = pgl_get(node->oid);
+
+	has_only_one_child(ptmp, &child_idx);
+	tmp_child = ptmp->slots[child_idx];
+
+	struct tree_map_node *pchild = pgl_get(tmp_child.oid);
 
 	/*
 	 * That child's incoming label is appended to the ours incoming label
 	 * and the child is removed.
 	 */
-	uint64_t new_key_size = D_RO(tmp)->key_size + D_RO(tmp_child)->key_size;
+	uint64_t new_key_size = ptmp->key_size + pchild->key_size;
 	unsigned char *new_key = (unsigned char *)malloc(new_key_size);
 	assert(new_key != NULL);
-	memcpy(new_key, D_RO(tmp)->key, D_RO(tmp)->key_size);
-	memcpy(new_key + D_RO(tmp)->key_size,
-		D_RO(tmp_child)->key,
-		D_RO(tmp_child)->key_size);
+	memcpy(new_key, ptmp->key, ptmp->key_size);
+	memcpy(new_key + ptmp->key_size, pchild->key, pchild->key_size);
 
-	TX_ADD_DIRECT(node);
 	*node = rtree_new_node(new_key, new_key_size,
-		D_RO(tmp_child)->value, D_RO(tmp_child)->has_value);
+			pchild->value, pchild->has_value);
+
+	/* node was tx_allocated in rtree_new_node() */
+	struct tree_map_node *pnode = pgl_tx_open(node->oid);
 
 	free(new_key);
-	TX_FREE(tmp);
 
-	memcpy(D_RW(*node)->slots,
-			D_RO(tmp_child)->slots,
-			sizeof(D_RO(tmp_child)->slots));
-	TX_FREE(tmp_child);
+	pgl_tx_free(tmp.oid);
+
+	pnode = pgl_tx_add_range(pnode,
+			offsetof(struct tree_map_node, slots),
+			sizeof(pchild->slots));
+
+	memcpy(pnode->slots, pchild->slots, sizeof(pchild->slots));
+
+	pgl_tx_free(tmp_child.oid);
 }
 
 /*
@@ -403,30 +433,31 @@ rtree_map_remove_node(TOID(struct rtree_map) map,
 	if (TOID_IS_NULL(*node))
 		return OID_NULL;
 
-	i = key_comm_len(*node, key, key_size);
+	struct tree_map_node *pnode = pgl_get(node->oid);
 
-	if (i != D_RO(*node)->key_size)
+	i = key_comm_len(pnode, key, key_size);
+
+	if (i != pnode->key_size)
 		/* Node does not exist */
 		return OID_NULL;
 
 	if (i == key_size) {
-		if (0 == D_RO(*node)->has_value)
+		if (0 == pnode->has_value)
 			return OID_NULL;
 
 		/* Node is found */
-		ret = D_RO(*node)->value;
+		ret = pnode->value;
+
+		pnode = pgl_tx_add_range(pnode,
+				offsetof(struct tree_map_node, has_value),
+				sizeof(unsigned) + sizeof(PMEMoid));
 
 		/* delete node from tree */
-		TX_ADD_FIELD((*node), value);
-		TX_ADD_FIELD((*node), has_value);
-		D_RW(*node)->value = OID_NULL;
-		D_RW(*node)->has_value = 0;
+		pnode->value = OID_NULL;
+		pnode->has_value = 0;
 
-		if (is_leaf(*node)) {
-			pmemobj_tx_add_range(node->oid, 0,
-					sizeof(*node) + D_RO(*node)->key_size);
-			TX_FREE(*node);
-			TX_ADD_DIRECT(node);
+		if (is_leaf(pnode)) {
+			pgl_tx_free(node->oid);
 			(*node) = TOID_NULL(struct tree_map_node);
 		}
 
@@ -434,20 +465,22 @@ rtree_map_remove_node(TOID(struct rtree_map) map,
 	}
 
 	/* Recurse deeply */
+	pnode = pgl_tx_add_range(pnode,
+			offsetof(struct tree_map_node, slots[key[i]]),
+			sizeof(PMEMoid));
 	ret = rtree_map_remove_node(map,
-			&D_RW(*node)->slots[key[i]],
+			&pnode->slots[key[i]],
 			key + i, key_size - i,
 			&c4c);
 
 	if (c4c) {
 		/* Our node has child with only one child. Remove. */
-		remove_extra_node(&D_RW(*node)->slots[key[i]]);
+		remove_extra_node(&pnode->slots[key[i]]);
 
 		return ret;
 	}
 
-	if (has_only_one_child(*node, &child_idx) &&
-			(0 == D_RO(*node)->has_value)) {
+	if (has_only_one_child(pnode, &child_idx) && (0 == pnode->has_value)) {
 		*check_for_child = true;
 	}
 
@@ -467,16 +500,17 @@ rtree_map_remove(PMEMobjpool *pop, TOID(struct rtree_map) map,
 	if (TOID_IS_NULL(map))
 		return OID_NULL;
 
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
+		struct rtree_map *rmap = pgl_tx_open(map.oid);
 		ret = rtree_map_remove_node(map,
-				&D_RW(map)->root, key, key_size,
+				&rmap->root, key, key_size,
 				&check_for_child);
 
 		if (check_for_child) {
 			/* Our root node has only one child. Remove. */
-			remove_extra_node(&D_RW(map)->root);
+			remove_extra_node(&rmap->root);
 		}
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -493,11 +527,11 @@ rtree_map_remove_free(PMEMobjpool *pop, TOID(struct rtree_map) map,
 	if (TOID_IS_NULL(map))
 		return 1;
 
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
 		pmemobj_tx_free(rtree_map_remove(pop, map, key, key_size));
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -514,19 +548,22 @@ rtree_map_get_in_node(TOID(struct tree_map_node) node,
 	if (TOID_IS_NULL(node))
 		return OID_NULL;
 
-	i = key_comm_len(node, key, key_size);
+	struct tree_map_node *pnode = pgl_get(node.oid);
 
-	if (i != D_RO(node)->key_size)
+	i = key_comm_len(pnode, key, key_size);
+
+	if (i != pnode->key_size)
 		/* Node does not exist */
 		return OID_NULL;
 
 	if (i == key_size) {
 		/* Node is found */
-		return D_RO(node)->value;
+		PMEMoid value = pnode->value;
+		return value;
 	} else {
 		/* Recurse deeply */
-		return rtree_map_get_in_node(D_RO(node)->slots[key[i]],
-				key + i, key_size - i);
+		TOID(struct tree_map_node) slot = pnode->slots[key[i]];
+		return rtree_map_get_in_node(slot, key + i, key_size - i);
 	}
 }
 
@@ -537,10 +574,13 @@ PMEMoid
 rtree_map_get(PMEMobjpool *pop, TOID(struct rtree_map) map,
 		const unsigned char *key, uint64_t key_size)
 {
-	if (TOID_IS_NULL(D_RO(map)->root))
+	struct rtree_map *rmap = pgl_get(map.oid);
+	if (TOID_IS_NULL(rmap->root))
 		return OID_NULL;
 
-	return rtree_map_get_in_node(D_RO(map)->root, key, key_size);
+	PMEMoid retoid = rtree_map_get_in_node(rmap->root, key, key_size);
+
+	return retoid;
 }
 
 /*
@@ -555,20 +595,22 @@ rtree_map_lookup_in_node(TOID(struct tree_map_node) node,
 	if (TOID_IS_NULL(node))
 		return 0;
 
-	i = key_comm_len(node, key, key_size);
+	struct tree_map_node *pnode = pgl_get(node.oid);
 
-	if (i != D_RO(node)->key_size)
+	i = key_comm_len(pnode, key, key_size);
+
+	if (i != pnode->key_size)
 		/* Node does not exist */
 		return 0;
 
-	if (i == key_size) {
+	if (i == key_size)
 		/* Node is found */
 		return 1;
-	}
+
+	TOID(struct tree_map_node) slot = pnode->slots[key[i]];
 
 	/* Recurse deeply */
-	return rtree_map_lookup_in_node(D_RO(node)->slots[key[i]],
-			key + i, key_size - i);
+	return rtree_map_lookup_in_node(slot, key + i, key_size - i);
 }
 
 /*
@@ -578,10 +620,14 @@ int
 rtree_map_lookup(PMEMobjpool *pop, TOID(struct rtree_map) map,
 		const unsigned char *key, uint64_t key_size)
 {
-	if (TOID_IS_NULL(D_RO(map)->root))
+	struct rtree_map *rmap = pgl_get(map.oid);
+
+	if (TOID_IS_NULL(rmap->root))
 		return 0;
 
-	return rtree_map_lookup_in_node(D_RO(map)->root, key, key_size);
+	int found = rtree_map_lookup_in_node(rmap->root, key, key_size);
+
+	return found;
 }
 
 /*
@@ -598,14 +644,15 @@ rtree_map_foreach_node(const TOID(struct tree_map_node) node,
 	if (TOID_IS_NULL(node))
 		return 0;
 
+	struct tree_map_node *pnode = pgl_get(node.oid);
+
 	for (i = 0; i < ALPHABET_SIZE; i++) {
-		if (rtree_map_foreach_node(D_RO(node)->slots[i], cb, arg) != 0)
+		if (rtree_map_foreach_node(pnode->slots[i], cb, arg) != 0)
 			return 1;
 	}
 
 	if (NULL != cb) {
-		if (cb(D_RO(node)->key, D_RO(node)->key_size,
-					D_RO(node)->value, arg) != 0)
+		if (cb(pnode->key, pnode->key_size, pnode->value, arg) != 0)
 			return 1;
 	}
 
@@ -621,7 +668,10 @@ rtree_map_foreach(PMEMobjpool *pop, TOID(struct rtree_map) map,
 			PMEMoid value, void *arg),
 	void *arg)
 {
-	return rtree_map_foreach_node(D_RO(map)->root, cb, arg);
+	struct rtree_map *rmap = pgl_get(map.oid);
+	TOID(struct tree_map_node) root = rmap->root;
+
+	return rtree_map_foreach_node(root, cb, arg);
 }
 
 /*

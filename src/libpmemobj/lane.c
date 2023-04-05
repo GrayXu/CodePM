@@ -55,6 +55,8 @@
 #include "palloc.h"
 #include "tx.h"
 
+#include "pangolin.h"
+
 static os_tls_key_t Lane_info_key;
 
 static __thread struct cuckoo *Lane_info_ht;
@@ -191,7 +193,11 @@ lane_ulog_constructor(void *base, void *ptr, size_t usable_size, void *arg)
 	size_t capacity = ALIGN_DOWN(usable_size - sizeof(struct ulog),
 		CACHELINE_SIZE);
 
+#ifndef PANGOLIN_LOGREP
 	ulog_construct(OBJ_PTR_TO_OFF(base, ptr), capacity, 1, p_ops);
+#else
+	ulog_construct(OBJ_PTR_TO_OFF(base, ptr), capacity, 1, 1, p_ops);
+#endif
 
 	return 0;
 }
@@ -206,8 +212,17 @@ lane_undo_extend(void *base, uint64_t *redo)
 	struct tx_parameters *params = pop->tx_params;
 	size_t s = SIZEOF_ALIGNED_ULOG(params->cache_size);
 
+#ifdef PANGOLIN_LOGREP
+	s += s; /* double the allocation size */
+#endif
+
+#ifndef PANGOLIN_PARITY
 	return pmalloc_construct(base, redo, s, lane_ulog_constructor, NULL,
 		0, OBJ_INTERNAL_OBJECT_MASK, 0);
+#else
+	return pmalloc_construct(base, redo, s, lane_ulog_constructor, NULL,
+		0, OBJ_INTERNAL_OBJECT_MASK | OBJ_PANGOLIN_LOGS_MASK, 0);
+#endif
 }
 
 /*
@@ -216,10 +231,23 @@ lane_undo_extend(void *base, uint64_t *redo)
 static int
 lane_redo_extend(void *base, uint64_t *redo)
 {
-	size_t s = SIZEOF_ALIGNED_ULOG(LANE_REDO_EXTERNAL_SIZE);
+#ifdef PANGOLIN_LOGREP
+	PMEMobjpool *pop = base;
+	struct tx_parameters *params = pop->tx_params;
+	size_t s = SIZEOF_ALIGNED_ULOG(params->cache_size);
 
+	s += s; /* double the allocation size */
+#else
+	size_t s = SIZEOF_ALIGNED_ULOG(LANE_REDO_EXTERNAL_SIZE);
+#endif
+
+#ifndef PANGOLIN_PARITY
 	return pmalloc_construct(base, redo, s, lane_ulog_constructor, NULL,
 		0, OBJ_INTERNAL_OBJECT_MASK, 0);
+#else
+	return pmalloc_construct(base, redo, s, lane_ulog_constructor, NULL,
+		0, OBJ_INTERNAL_OBJECT_MASK | OBJ_PANGOLIN_LOGS_MASK, 0);
+#endif
 }
 
 /*
@@ -336,17 +364,34 @@ lane_init_data(PMEMobjpool *pop)
 
 	for (uint64_t i = 0; i < pop->nlanes; ++i) {
 		layout = lane_get_layout(pop, i);
+#ifndef PANGOLIN_LOGREP
 		ulog_construct(OBJ_PTR_TO_OFF(pop, &layout->internal),
 			LANE_REDO_INTERNAL_SIZE, 0, &pop->p_ops);
 		ulog_construct(OBJ_PTR_TO_OFF(pop, &layout->external),
 			LANE_REDO_EXTERNAL_SIZE, 0, &pop->p_ops);
 		ulog_construct(OBJ_PTR_TO_OFF(pop, &layout->undo),
 			LANE_UNDO_SIZE, 0, &pop->p_ops);
+#else
+		ulog_construct(OBJ_PTR_TO_OFF(pop, &layout->internal),
+			LANE_REDO_INTERNAL_SIZE, 0, 0, &pop->p_ops);
+		ulog_construct(OBJ_PTR_TO_OFF(pop, &layout->external),
+			LANE_REDO_EXTERNAL_SIZE, 0, 0, &pop->p_ops);
+		ulog_construct(OBJ_PTR_TO_OFF(pop, &layout->undo),
+			LANE_UNDO_SIZE, 0, 0, &pop->p_ops);
+#endif
 	}
 	layout = lane_get_layout(pop, 0);
 	pmemops_xpersist(&pop->p_ops, layout,
 		pop->nlanes * sizeof(struct lane_layout),
 		PMEMOBJ_F_RELAXED);
+
+#ifdef PANGOLIN_LOGREP
+	void *lanesrep = pangolin_repaddr(pop, layout);
+	/* persist only; replication performed in ulog_construct() */
+	pmemops_xpersist(&pop->p_ops, lanesrep,
+		pop->nlanes * sizeof(struct lane_layout),
+		PMEMOBJ_F_RELAXED);
+#endif
 }
 
 /*
@@ -405,6 +450,14 @@ lane_recover_and_section_boot(PMEMobjpool *pop)
 		layout = lane_get_layout(pop, i);
 
 		struct ulog *undo = (struct ulog *)&layout->undo;
+#ifdef PANGOLIN
+		/*
+		 * Pangolin uses the undo lanes for redo logging. See obuf_tx.c
+		 * for setting and clearing it.
+		 */
+		if (!undo->replay)
+			continue;
+#endif
 
 		struct operation_context *ctx = operation_new(
 			undo,

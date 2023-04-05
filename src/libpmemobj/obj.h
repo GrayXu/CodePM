@@ -206,6 +206,11 @@ struct pmemobjpool {
 	char unused2[992];
 };
 
+#ifdef PANGOLIN_PARITY
+/* logs that overflow and allocated in to zone region */
+#define OBJ_PANGOLIN_LOGS_MASK ((1ULL) << 14)
+#endif
+
 /*
  * Stored in the 'size' field of oobh header, determines whether the object
  * is internal or not. Internal objects are skipped in pmemobj iteration

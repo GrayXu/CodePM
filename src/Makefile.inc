@@ -95,6 +95,8 @@ DEBUG_CFLAGS += -O0 -ggdb -DDEBUG
 LIB_SUBDIR = /pmdk_debug
 OBJDIR = debug
 else
+# Add -fno-inline -fno-omit-frame-pointer after -O2 for perf sampling.
+# They slightly worsen the performance but give full call stack information.
 DEFAULT_CFLAGS += -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 LIB_SUBDIR =
 OBJDIR = nondebug
@@ -139,10 +141,60 @@ CFLAGS += -fsanitize=$(tsanitize)
 LDFLAGS += -fsanitize=$(tsanitize)
 endif
 
+# enable a pangolin build
+ifeq ($(PANGOLIN),1)
+CFLAGS += -DPANGOLIN
+endif
+
+# enable hardware lock elision for parity updates
+ifeq ($(PANGOLIN_RCLOCKHLE),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_RCLOCKHLE
+endif
+
+# enable undo log replication with a pangolin build
+ifeq ($(PANGOLIN_LOGREP),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_LOGREP
+endif
+
+# enable metadata replication with a pangolin build
+ifeq ($(PANGOLIN_METAREP),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_METAREP
+endif
+
+# enable object parity with a pangolin build
+# its reserves some space for metadata replication and object parity
+ifeq ($(PANGOLIN_PARITY),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_PARITY
+endif
+
+# enable object checksum with a pangolin build
+ifeq ($(PANGOLIN_CHECKSUM),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_CHECKSUM
+endif
+
 CFLAGS += $(EXTRA_CFLAGS)
 
 ifeq ($(DEBUG),1)
 CFLAGS += $(EXTRA_CFLAGS_DEBUG) $(DEBUG_CFLAGS)
+ifeq ($(PROBE),1)
+CFLAGS += -DPROBE
+CXXFLAGS += -DPROBE
+endif
 else
 CFLAGS += $(EXTRA_CFLAGS_RELEASE)
 endif

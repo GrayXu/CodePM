@@ -66,6 +66,7 @@ RUN dnf update -y \
 	make \
 	man \
 	ncurses-devel \
+	numactl-devel \
 	openssh-server \
 	pandoc \
 	passwd \

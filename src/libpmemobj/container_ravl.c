@@ -44,6 +44,17 @@ struct block_container_ravl {
 	struct ravl *tree;
 };
 
+#ifdef PANGOLIN
+static void
+free_ravl_data(void *data, void *arg)
+{
+	/* check ravl_data() for this code */
+	void *dp;
+	memcpy(&dp, data, sizeof(void *));
+	Free(dp);
+}
+#endif
+
 /*
  * container_compare_memblocks -- (internal) compares two memory blocks
  */
@@ -83,7 +94,11 @@ container_ravl_insert_block(struct block_container *bc,
 	struct block_container_ravl *c =
 		(struct block_container_ravl *)bc;
 
+#ifdef PANGOLIN
+	struct memory_block *e = Malloc(sizeof(struct memory_block));
+#else
 	struct memory_block *e = m->m_ops->get_user_data(m);
+#endif
 	VALGRIND_DO_MAKE_MEM_DEFINED(e, sizeof(*e));
 	VALGRIND_ADD_TO_TX(e, sizeof(*e));
 	*e = *m;
@@ -113,6 +128,10 @@ container_ravl_get_rm_block_bestfit(struct block_container *bc,
 	*m = *e;
 	ravl_remove(c->tree, n);
 
+#ifdef PANGOLIN
+	Free(e);
+#endif
+
 	return 0;
 }
 
@@ -130,6 +149,10 @@ container_ravl_get_rm_block_exact(struct block_container *bc,
 	struct ravl_node *n = ravl_find(c->tree, m, RAVL_PREDICATE_EQUAL);
 	if (n == NULL)
 		return ENOMEM;
+
+#ifdef PANGOLIN
+	Free(ravl_data(n));
+#endif
 
 	ravl_remove(c->tree, n);
 
@@ -170,7 +193,11 @@ container_ravl_rm_all(struct block_container *bc)
 	struct block_container_ravl *c =
 		(struct block_container_ravl *)bc;
 
+#ifdef PANGOLIN
+	ravl_clear_cb(c->tree, free_ravl_data, NULL);
+#else
 	ravl_clear(c->tree);
+#endif
 }
 
 /*
@@ -182,7 +209,11 @@ container_ravl_destroy(struct block_container *bc)
 	struct block_container_ravl *c =
 		(struct block_container_ravl *)bc;
 
+#ifdef PANGOLIN
+	ravl_delete_cb(c->tree, free_ravl_data, NULL);
+#else
 	ravl_delete(c->tree);
+#endif
 
 	Free(bc);
 }

@@ -37,7 +37,7 @@
 #ifndef LIBPMEMOBJ_INTERNAL_TX_H
 #define LIBPMEMOBJ_INTERNAL_TX_H 1
 
-#include <stdint.h>
+#include <stddef.h>
 #include "obj.h"
 #include "ulog.h"
 

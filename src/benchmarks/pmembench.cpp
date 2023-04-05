@@ -395,6 +395,17 @@ pmembench_merge_clos(struct benchmark *bench)
 static int
 pmembench_run_worker(struct benchmark *bench, struct worker_info *winfo)
 {
+	/*
+	 * NVSL: The timing method implemented here calls benchmark_time_get()
+	 * for every single operation and this could amplify the latency of
+	 * short operations, for example memcpy or clflush on 64-byte data.
+	 *
+	 * An alternative timing method is to call benchmark_time_get() for the
+	 * winfo->nops operations together. This needs to remove the
+	 * benchmark_time_get() call inside the for-loop, remove the thres->nops
+	 * factor from Tget estimation, and adjust the average latency
+	 * calculation in get_total_results().
+	 */
 	benchmark_time_get(&winfo->beg);
 	for (size_t i = 0; i < winfo->nops; i++) {
 		if (bench->info->operation(bench, &winfo->opinfo[i]))
@@ -414,15 +425,16 @@ pmembench_print_header(struct pmembench *pb, struct benchmark *bench,
 		       struct clo_vec *clovec)
 {
 	if (pb->scenario) {
-		printf("%s: %s [%" PRIu64 "]%s%s%s\n", pb->scenario->name,
+		printf(">%s: %s [%" PRIu64 "]%s%s%s\n", pb->scenario->name,
 		       bench->info->name, clovec->nargs,
 		       pb->scenario->group ? " [group: " : "",
 		       pb->scenario->group ? pb->scenario->group : "",
 		       pb->scenario->group ? "]" : "");
 	} else {
-		printf("%s [%" PRIu64 "]\n", bench->info->name, clovec->nargs);
+		printf(">%s [%" PRIu64 "]\n", bench->info->name, clovec->nargs);
 	}
-	printf("total-avg[sec];"
+	printf("benchmark;"
+	       "total-avg[sec];"
 	       "ops-per-second[1/sec];"
 	       "total-max[sec];"
 	       "total-min[sec];"
@@ -457,13 +469,13 @@ static void
 pmembench_print_results(struct benchmark *bench, struct benchmark_args *args,
 			struct total_results *res)
 {
-	printf("%f;%f;%f;%f;%f;%f;%" PRIu64 ";%" PRIu64 ";%" PRIu64
+	printf("%s;%f;%f;%f;%f;%f;%f;%" PRIu64 ";%" PRIu64 ";%" PRIu64
 	       ";%f;%" PRIu64 ";%" PRIu64 ";%" PRIu64,
-	       res->total.avg, res->nopsps, res->total.max, res->total.min,
-	       res->total.med, res->total.std_dev, res->latency.avg,
-	       res->latency.min, res->latency.max, res->latency.std_dev,
-	       res->latency.pctl50_0p, res->latency.pctl99_0p,
-	       res->latency.pctl99_9p);
+	       bench->info->name, res->total.avg, res->nopsps, res->total.max,
+	       res->total.min, res->total.med, res->total.std_dev,
+	       res->latency.avg, res->latency.min, res->latency.max,
+	       res->latency.std_dev, res->latency.pctl50_0p,
+	       res->latency.pctl99_0p, res->latency.pctl99_9p);
 
 	size_t i;
 	for (i = 0; i < bench->nclos; i++) {
@@ -859,6 +871,27 @@ get_total_results(struct total_results *tres)
 
 				beg = &thres->end_op[o];
 			}
+			/*
+			 * NVSL: The following calculation corresponds to an
+			 * alternative timing method mentioned in
+			 * pmembench_run_worker(). But this method does not
+			 * support std deviations.
+			 *
+			 * When using this method:
+			 *   Remove tres->nops from:
+			 *          nsecs = tres->nops * Get_time_avg;
+			 *   Remove above line:
+			 *          tres->latency.avg += nsecs;
+			 *   Remove assert(nsecs >= 0); from
+			 *          function benchmark_time_diff().
+			 *
+			 * benchmark_time_t opstime;
+			 * benchmark_time_diff(&opstime,
+			 *                     &thres->beg, &thres->end);
+			 * uint64_t opsns = benchmark_time_get_nsecs(&opstime);
+			 * tres->latency.avg += opsns;
+			 *
+			 */
 		}
 	}
 
@@ -1105,7 +1138,7 @@ pmembench_remove_file(const char *path)
 		return 0;
 
 	if (!(status.st_mode & S_IFDIR))
-		return pmempool_rm(path, 0);
+		return pmempool_rm(path, PMEMPOOL_RM_FORCE);
 
 	struct dir_handle it;
 	struct file_info info;

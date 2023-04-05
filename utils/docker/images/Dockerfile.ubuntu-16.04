@@ -59,6 +59,7 @@ RUN apt-get update \
 	libjson-c-dev \
 	libkmod-dev \
 	libncurses5-dev \
+	libnuma-dev \
 	libtool \
 	libudev-dev \
 	libunwind8-dev \

@@ -66,6 +66,11 @@ void ravl_delete(struct ravl *ravl);
 void ravl_delete_cb(struct ravl *ravl, ravl_cb cb, void *arg);
 int ravl_empty(struct ravl *ravl);
 void ravl_clear(struct ravl *ravl);
+
+#ifdef PANGOLIN
+void ravl_clear_cb(struct ravl *ravl, ravl_cb cb, void *arg);
+#endif
+
 int ravl_insert(struct ravl *ravl, const void *data);
 int ravl_emplace(struct ravl *ravl, ravl_constr constr, const void *arg);
 int ravl_emplace_copy(struct ravl *ravl, const void *data);

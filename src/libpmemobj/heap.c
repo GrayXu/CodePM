@@ -52,6 +52,10 @@
 #include "os_thread.h"
 #include "set.h"
 
+#ifdef PANGOLIN
+#include "pangolin.h"
+#endif
+
 #define MAX_RUN_LOCKS MAX_CHUNK
 #define MAX_RUN_LOCKS_VG 1024 /* avoid perf issues /w drd */
 
@@ -279,10 +283,19 @@ zone_calc_size_idx(uint32_t zone_id, unsigned max_zone, size_t heap_size)
 	ASSERT(heap_size >= zone_id * ZONE_MAX_SIZE);
 	size_t zone_raw_size = heap_size - zone_id * ZONE_MAX_SIZE;
 
+#ifndef PANGOLIN_METAREP
 	ASSERT(zone_raw_size >= (sizeof(struct zone_header) +
 			sizeof(struct chunk_header) * MAX_CHUNK));
 	zone_raw_size -= sizeof(struct zone_header) +
 		sizeof(struct chunk_header) * MAX_CHUNK;
+#else
+	/* libpmemobj may have a bug: it should also cut this heap_header */
+	if (zone_id == 0)
+		zone_raw_size -= sizeof(struct heap_header);
+	/* sizeof(struct zone) contains zone metadata replication */
+	ASSERT(zone_raw_size >= sizeof(struct zone));
+	zone_raw_size -= sizeof(struct zone);
+#endif
 
 	size_t zone_size_idx = zone_raw_size / CHUNKSIZE;
 	ASSERT(zone_size_idx <= UINT32_MAX);
@@ -303,14 +316,44 @@ heap_zone_init(struct palloc_heap *heap, uint32_t zone_id,
 
 	ASSERT(size_idx - first_chunk_id > 0);
 
+#ifdef PANGOLIN_PARITY
+	/* Reserve space for metadata replication and object parity */
+	uint32_t new_size_idx = pangolin_adjust_zone_size(zone_id);
+
+	ASSERT(new_size_idx <= size_idx);
+	size_idx = new_size_idx;
+#endif
+
 	memblock_huge_init(heap, first_chunk_id, zone_id,
 		size_idx - first_chunk_id);
 
+#ifndef PANGOLIN_CHECKSUM
 	struct zone_header nhdr = {
 		.size_idx = size_idx,
 		.magic = ZONE_HEADER_MAGIC,
 	};
 	z->header = nhdr; /* write the entire header (8 bytes) at once */
+#else
+	struct zone_header nhdr = {
+		.checksum = 0,
+		.chkstart = 0,
+		.size_idx = size_idx,
+		.magic = ZONE_HEADER_MAGIC,
+	};
+	nhdr.checksum = pangolin_adler32(CSUM0, &nhdr.chkstart,
+		sizeof(struct zone_header) - sizeof(nhdr.checksum));
+	nhdr.checksum = pangolin_adler32(nhdr.checksum, &z->chunk_headers,
+		sizeof(z->chunk_headers));
+	/*
+	 * It's fine to be more than 8 bytes because we have the checksum to
+	 * tell consistency.
+	 */
+	z->header = nhdr;
+#endif
+
+#ifdef PANGOLIN_METAREP
+	pangolin_replicate_zone(heap->base, &z->header, sizeof(z->header));
+#endif
 	pmemops_persist(&heap->p_ops, &z->header, sizeof(z->header));
 }
 
@@ -1009,6 +1052,10 @@ error_bucket_create:
 int
 heap_extend(struct palloc_heap *heap, struct bucket *b, size_t size)
 {
+#ifdef PANGOLIN
+	FATAL("%s Currently Pangolin replication and parity does not support "
+		"heap extend", __func__);
+#endif
 	void *nptr = util_pool_extend(heap->set, &size, PMEMOBJ_MIN_PART);
 	if (nptr == NULL)
 		return -1;
@@ -1191,16 +1238,47 @@ heap_init(void *heap_start, uint64_t heap_size, uint64_t *sizep,
 	VALGRIND_DO_MAKE_MEM_UNDEFINED(heap_start, heap_size);
 
 	struct heap_layout *layout = heap_start;
+
+#ifdef PANGOLIN_PARITY
+	/*
+	 * Zero-fill the heap region for parity correctness. Some file systems
+	 * may have done this with fallocate(), that is called via
+	 * pmemobj_create(). But POSIX does not seem to guarantee zeroing data
+	 * with fallocate().
+	 *
+	 * This is a one-time overhead when the object pool is created. For
+	 * benchmarking it's not timed, but every new run does create a new
+	 * pool, so the overall run-time to get benchmark results can be long.
+	 * We can disable this zeroing with an environment variable.
+	 */
+	char *env_zero_heap = os_getenv("PANGOLIN_ZERO_HEAP");
+	if (env_zero_heap) {
+		if (strtoul(env_zero_heap, NULL, 0) > 0)
+			pmemops_memset(p_ops, heap_start, 0, heap_size, 0);
+	}
+#endif
 	heap_write_header(&layout->header);
+#ifdef PANGOLIN_METAREP
+	pangolin_replicate_heap_header(p_ops->base, &layout->header,
+		sizeof(struct heap_header));
+#endif
 	pmemops_persist(p_ops, &layout->header, sizeof(struct heap_header));
 
 	unsigned zones = heap_max_zone(heap_size);
+
 	for (unsigned i = 0; i < zones; ++i) {
 		struct zone *zone = ZID_TO_ZONE(layout, i);
 		pmemops_memset(p_ops, &zone->header, 0,
 				sizeof(struct zone_header), 0);
 		pmemops_memset(p_ops, &zone->chunk_headers, 0,
 				sizeof(struct chunk_header), 0);
+#ifdef PANGOLIN_METAREP
+		/* zero-fill zone metadata relica */
+		pmemops_memset(p_ops, &zone->rephdr, 0,
+				sizeof(struct zone_header), 0);
+		pmemops_memset(p_ops, &zone->chunk_rephdrs, 0,
+				sizeof(struct chunk_header), 0);
+#endif
 
 		/* only explicitly allocated chunks should be accessible */
 		VALGRIND_DO_MAKE_MEM_NOACCESS(&zone->chunk_headers,
@@ -1256,6 +1334,9 @@ heap_cleanup(struct palloc_heap *heap)
 static int
 heap_verify_header(struct heap_header *hdr)
 {
+#ifdef PANGOLIN_METAREP
+	/* PGL-TODO: Pangolin can find the replicated version and fix it. */
+#endif
 	if (util_checksum(hdr, sizeof(*hdr), &hdr->checksum, 0, 0) != 1) {
 		ERR("heap: invalid header's checksum");
 		return -1;

@@ -30,8 +30,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 /*
- * map_bench.cpp -- benchmarks for: ctree, btree, rtree, rbtree, hashmap_atomic
- * and hashmap_tx from examples.
+ * map_bench.cpp -- benchmarks for: ctree, btree, rtree, rbtree, hashmap_atomic,
+ * hashmap_tx, and skiplist from examples.
  */
 #include <cassert>
 
@@ -49,6 +49,9 @@
 #include "map_hashmap_tx.h"
 #include "map_rbtree.h"
 #include "map_rtree.h"
+#include "map_skiplist.h"
+
+#include "libpangolin.h"
 
 /* Values less than 3 is not suitable for current rtree implementation */
 #define FACTOR 3
@@ -79,7 +82,7 @@ static const struct {
 	{"ctree", MAP_CTREE},		{"btree", MAP_BTREE},
 	{"rtree", MAP_RTREE},		{"rbtree", MAP_RBTREE},
 	{"hashmap_tx", MAP_HASHMAP_TX}, {"hashmap_atomic", MAP_HASHMAP_ATOMIC},
-	{"hashmap_rp", MAP_HASHMAP_RP}};
+	{"hashmap_rp", MAP_HASHMAP_RP}, {"skiplist", MAP_SKIPLIST}};
 
 #define MAP_TYPES_NUM (sizeof(map_types) / sizeof(map_types[0]))
 
@@ -89,6 +92,8 @@ struct map_bench_args {
 	char *type;
 	bool ext_tx;
 	bool alloc;
+	bool check_pool; /* check pool integrity after each run */
+	bool check_user; /* check user data integrity after each run */
 };
 
 struct map_bench_worker {
@@ -180,19 +185,20 @@ static int
 map_remove_free_op(struct map_bench *map_bench, uint64_t key)
 {
 	volatile int ret = 0;
-	TX_BEGIN(map_bench->pop)
+
+	PGL_TX_BEGIN(map_bench->pop)
 	{
 		PMEMoid val = map_remove(map_bench->mapc, map_bench->map, key);
 		if (OID_IS_NULL(val))
 			ret = -1;
 		else
-			pmemobj_tx_free(val);
+			pgl_tx_free(val);
 	}
-	TX_ONABORT
+	PGL_TX_ONABORT
 	{
 		ret = -1;
 	}
-	TX_END
+	PGL_TX_END
 
 	return ret;
 }
@@ -236,17 +242,17 @@ map_insert_alloc_op(struct map_bench *map_bench, uint64_t key)
 {
 	int ret = 0;
 
-	TX_BEGIN(map_bench->pop)
+	PGL_TX_BEGIN(map_bench->pop)
 	{
 		PMEMoid oid =
-			pmemobj_tx_alloc(map_bench->args->dsize, OBJ_TYPE_NUM);
+			pgl_tx_alloc(map_bench->args->dsize, OBJ_TYPE_NUM);
 		ret = map_insert(map_bench->mapc, map_bench->map, key, oid);
 	}
-	TX_ONABORT
+	PGL_TX_ONABORT
 	{
 		ret = -1;
 	}
-	TX_END
+	PGL_TX_END
 
 	return ret;
 }
@@ -351,9 +357,9 @@ map_common_init_worker(struct benchmark *bench, struct benchmark_args *args,
 	tree = (struct map_bench *)pmembench_get_priv(bench);
 	targs = (struct map_bench_args *)args->opts;
 	if (targs->ext_tx) {
-		int ret = pmemobj_tx_begin(tree->pop, nullptr);
+		int ret = pgl_tx_begin(tree->pop);
 		if (ret) {
-			(void)pmemobj_tx_end();
+			(void)pgl_tx_end();
 			goto err_free_keys;
 		}
 	}
@@ -380,8 +386,8 @@ map_common_free_worker(struct benchmark *bench, struct benchmark_args *args,
 	auto *targs = (struct map_bench_args *)args->opts;
 
 	if (targs->ext_tx) {
-		pmemobj_tx_commit();
-		(void)pmemobj_tx_end();
+		pgl_tx_commit();
+		(void)pgl_tx_end();
 	}
 	free(tworker->keys);
 	free(tworker);
@@ -567,8 +573,8 @@ map_common_init(struct benchmark *bench, struct benchmark_args *args)
 		map_bench->pool_size = 0;
 	}
 
-	map_bench->pop = pmemobj_create(path, "map_bench", map_bench->pool_size,
-					args->fmode);
+	/* poolsize is set to 0 to use the poolset file (args->fname) */
+	map_bench->pop = pmemobj_create(path, "map_bench", 0, args->fmode);
 	if (!map_bench->pop) {
 		fprintf(stderr, "pmemobj_create: %s\n", pmemobj_errormsg());
 		goto err_free_bench;
@@ -594,12 +600,21 @@ map_common_init(struct benchmark *bench, struct benchmark_args *args)
 
 	map_bench->root_oid = map_bench->root.oid;
 
-	if (map_create(map_bench->mapc, &D_RW(map_bench->root)->map, nullptr)) {
-		perror("map_new");
-		goto err_free_map;
+	PGL_TX_BEGIN(map_bench->pop)
+	{
+		struct root *proot =
+			(struct root *)pgl_tx_open(map_bench->root.oid);
+		if (map_create(map_bench->mapc, &proot->map, NULL)) {
+			perror("map_new");
+			goto err_free_map;
+		}
 	}
+	PGL_TX_END;
 
 	map_bench->map = D_RO(map_bench->root)->map;
+
+	pgl_reset_stats();
+	pgl_close_all_shared();
 
 	pmembench_set_priv(bench, map_bench);
 	return 0;
@@ -621,6 +636,22 @@ static int
 map_common_exit(struct benchmark *bench, struct benchmark_args *args)
 {
 	auto *tree = (struct map_bench *)pmembench_get_priv(bench);
+	struct map_bench_args *pa = (struct map_bench_args *)args->opts;
+
+	pgl_print_stats();
+
+	if (pa->check_pool) {
+		if (pangolin_check_pool(tree->pop, 0) != 0)
+			fprintf(stderr,
+				RED "pangolin pool check failed; "
+				    "see details with debug build\n" RST);
+	}
+	if (pa->check_user) {
+		if (pangolin_check_objs(tree->pop, 0) != 0)
+			fprintf(stderr,
+				RED "pangolin objs check failed; "
+				    "see details with debug build\n" RST);
+	}
 
 	os_mutex_destroy(&tree->lock);
 	map_ctx_free(tree->mapc);
@@ -653,20 +684,18 @@ map_keys_init(struct benchmark *bench, struct benchmark_args *args)
 
 	mutex_lock_nofail(&map_bench->lock);
 
-	TX_BEGIN(map_bench->pop)
-	{
-		for (size_t i = 0; i < map_bench->nkeys; i++) {
-			uint64_t key;
-			PMEMoid oid;
-			do {
-				key = get_key(&targs->seed, targs->max_key);
-				oid = map_get(map_bench->mapc, map_bench->map,
-					      key);
-			} while (!OID_IS_NULL(oid));
+	for (size_t i = 0; i < map_bench->nkeys; i++) {
+		uint64_t key;
+		PMEMoid oid;
+		do {
+			key = get_key(&targs->seed, targs->max_key);
+			oid = map_get(map_bench->mapc, map_bench->map, key);
+		} while (!OID_IS_NULL(oid));
 
+		PGL_TX_BEGIN(map_bench->pop)
+		{
 			if (targs->alloc)
-				oid = pmemobj_tx_alloc(args->dsize,
-						       OBJ_TYPE_NUM);
+				oid = pgl_tx_alloc(args->dsize, OBJ_TYPE_NUM);
 			else
 				oid = map_bench->root_oid;
 
@@ -677,14 +706,13 @@ map_keys_init(struct benchmark *bench, struct benchmark_args *args)
 
 			map_bench->keys[i] = key;
 		}
+		PGL_TX_END
 	}
-	TX_ONABORT
-	{
-		ret = -1;
-	}
-	TX_END
 
 	mutex_unlock_nofail(&map_bench->lock);
+
+	pgl_reset_stats();
+	pgl_close_all_shared();
 
 	if (!ret)
 		return 0;
@@ -762,7 +790,7 @@ map_get_exit(struct benchmark *bench, struct benchmark_args *args)
 	return map_common_exit(bench, args);
 }
 
-static struct benchmark_clo map_bench_clos[5];
+static struct benchmark_clo map_bench_clos[7];
 
 static struct benchmark_info map_insert_info;
 static struct benchmark_info map_remove_info;
@@ -776,7 +804,7 @@ map_bench_constructor(void)
 	map_bench_clos[0].opt_long = "type";
 	map_bench_clos[0].descr =
 		"Type of container "
-		"[ctree|btree|rtree|rbtree|hashmap_tx|hashmap_atomic]";
+		"[ctree|btree|rtree|rbtree|hashmap_tx|hashmap_atomic|skiplist]";
 
 	map_bench_clos[0].off = clo_field_offset(struct map_bench_args, type);
 	map_bench_clos[0].type = CLO_TYPE_STR;
@@ -821,6 +849,20 @@ map_bench_constructor(void)
 				  "when inserting";
 	map_bench_clos[4].off = clo_field_offset(struct map_bench_args, alloc);
 	map_bench_clos[4].type = CLO_TYPE_FLAG;
+
+	map_bench_clos[5].opt_long = "check-pool";
+	map_bench_clos[5].descr = "Check pool integrity after each run";
+	map_bench_clos[5].type = CLO_TYPE_FLAG;
+	map_bench_clos[5].off =
+		clo_field_offset(struct map_bench_args, check_pool);
+	map_bench_clos[5].def = "false";
+
+	map_bench_clos[6].opt_long = "check-user";
+	map_bench_clos[6].descr = "Check user data integrity after each run";
+	map_bench_clos[6].type = CLO_TYPE_FLAG;
+	map_bench_clos[6].off =
+		clo_field_offset(struct map_bench_args, check_user);
+	map_bench_clos[6].def = "false";
 
 	map_insert_info.name = "map_insert";
 	map_insert_info.brief = "Inserting to tree map";

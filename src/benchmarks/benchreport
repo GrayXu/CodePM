@@ -1,0 +1,148 @@
+#!/usr/bin/env python2
+#
+# Copyright 2017, University of California, San Diego
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in
+#       the documentation and/or other materials provided with the
+#       distribution.
+#
+#     * Neither the name of the copyright holder nor the names of its
+#       contributors may be used to endorse or promote products derived
+#       from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import os
+import re
+import sys
+import htmltable
+import pandas as pd
+
+pd.set_option('precision', 5)
+pd.set_option('display.width', 1000) # characters
+# pd.options.display.float_format = '{0:g}'.format
+# pd.options.display.float_format = '{:0,.3f}'.format # 1,234.567
+
+csvmark = 'runbench result file'
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print 'Please give the csv file name: ./report.py <filename>.csv'
+        sys.exit(0)
+
+    csvfile = sys.argv[1]
+    if not os.path.isfile(csvfile):
+        print csvfile, 'does not exist!'
+        sys.exit(0)
+
+    # Parse a large csv file with multiple result segments.
+    # buildq: (last, curr), buildrow is the line# starting with '#build'.
+    buildq, buildrow = ('', ''), 0
+    # The segments may have different headers (columns) so we can not use a
+    # single header format for all result data in the file.
+    csvsets, setname, sethead = [], '', 0
+    with open(csvfile) as lines:
+        for lnum, line in enumerate(lines):
+            line = line.rstrip('\n')
+            if lnum == 0 and line != csvmark:
+                print csvfile, 'marker error, expecting:', csvmark
+                sys.exit(0)
+
+            if lnum == sethead and sethead != 0 and line[:9] != 'benchmark':
+                # simple sanity check
+                # lnum + 1 for indexing from 1, same as in text editors
+                print csvfile, 'missing benchmark header row at line', lnum + 1
+                sys.exit(0)
+
+            # Char '>' identifies the scenario-benchmark information row.
+            # Immediately after this row should be a new result header row.
+            if lnum != 0 and line[0] == '>':
+                if sethead != 0:
+                    setrows = lnum - sethead - 1
+                    currbuild = buildq[1]
+                    if buildrow == lnum - 1:
+                        setrows -= 1 # remove the '#build:' row from data rows
+                        currbuild = buildq[0]
+                    csvsets.append((setname, currbuild, sethead, setrows))
+                    setname = line.lstrip('>')
+                else:
+                    setname = line.lstrip('>')
+                sethead = lnum + 1
+
+            # Row starting with '#build:' tells the current library being used.
+            if line[:7] == '#build:':
+                build = line[len('#build: '):]
+                buildq = buildq[1], build
+                buildrow = lnum
+
+            # Other rows should contain result data only.
+
+            # NO COMMENT LINES OR BLANK LINES ARE ALLOWED IN THIS VERSION
+
+    # Add the last segment.
+    if lnum > sethead:
+        csvsets.append((setname, buildq[1], sethead, lnum - sethead))
+
+    # Read result segments into separate dataframes and each may have a
+    # different amount of columns.
+    dfs, names = [], []
+    for setname, build, sethead, setrows in csvsets:
+        # index_col=False: not to use the first column as the index (row names)
+        # parse_dates=False: not to parse values as datetime strings
+        df = pd.read_csv(csvfile, sep=';', # comment='#',
+                         skiprows=sethead, nrows=setrows,
+                         index_col=False, parse_dates=False)
+        df['build'] = build
+        dfs.append(df)
+        names.append(setname)
+
+    # Concatenate all dataframes. If a dataframe does not have all columns, the
+    # missing ones should be filled with NaN.
+    # ignore_index=True: re-index rows from 0
+    dfall = pd.concat(dfs, ignore_index=True)
+
+    # select columns of interest (name, short_name)
+    colsel = [('benchmark', 'benchmark'), ('build', 'build'),
+              ('threads', 'ths'), ('ops-per-thread', 'ops/th'),
+              ('data-size', 'dsize'), ('operation', 'operation'),
+              ('latency-avg[nsec]', 'lat-avg[ns]'),
+              ('latency-min[nsec]', 'lat-min[ns]'),
+              ('latency-max[nsec]', 'lat-max[ns]'),
+              ('total-avg[sec]', 'runtime-avg[s]'),
+              ('ops-per-second[1/sec]', 'ops/s'),
+              ('repeats', 'reps')]
+
+    # not every column of interest is guaranteed present in dfall
+    colsel = [cs for cs in colsel if cs[0] in dfall.columns]
+
+    # dataframes of interest
+    dfoi = dfall[ [cs[0] for cs in colsel] ]
+
+    # use short column names in summary.
+    dfoi.columns = [cs[1] for cs in colsel]
+
+    print dfoi
+
+    dfs.insert(0, dfoi)
+    names.insert(0, 'PMEMBench Results Summary')
+
+    htmlfile = os.path.splitext(csvfile)[0] + '.html'
+    htmltable.dfs2html(dfs, names, title='PMEMBench Results', filename=htmlfile)

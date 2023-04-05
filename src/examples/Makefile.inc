@@ -120,6 +120,10 @@ all: $(TMP_HEADERS)
 	$(call check-cstyle, $<)
 	$(CC) -c -o $@ $(CFLAGS) $(INCS) $<
 
+%.i: %.c $(MAKEFILE_DEPS)
+	$(call check-cstyle, $<)
+	$(CC) -E -o $@ $(CFLAGS) $(INCS) $<
+
 %.o: %.cpp $(MAKEFILE_DEPS)
 	$(call check-cstyle, $<)
 	$(CXX) -c -o $@ $(CXXFLAGS) $(INCS) $<

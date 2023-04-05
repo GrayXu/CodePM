@@ -129,7 +129,11 @@ static struct {
  */
 #define RUN_SIZE_IDX_CAP (16)
 
+#ifdef PANGOLIN
+#define ALLOC_CLASS_DEFAULT_FLAGS 0
+#else
 #define ALLOC_CLASS_DEFAULT_FLAGS CHUNK_FLAG_FLEX_BITMAP
+#endif
 
 struct alloc_class_collection {
 	size_t granularity;

@@ -282,7 +282,6 @@ EXAMPLES_TESTS = \
 	ex_libpmem\
 	ex_libpmemblk\
 	ex_libpmemlog\
-	ex_libpmemobj\
 	ex_linkedlist
 
 LIBPMEMPOOL_DEPS = \
@@ -336,6 +335,11 @@ REMOTE_TESTS = \
 	pmempool_rm_remote\
 	pmempool_sync_remote\
 	pmempool_transform_remote
+
+#
+# ex_libpmemobj contains modified examples that only work with a pangolin build.
+#
+PANGOLIN_SKIPPED_TESTS = ex_libpmemobj
 
 TESTS = \
 	$(LOCAL_TESTS)\

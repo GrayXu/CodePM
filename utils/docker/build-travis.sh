@@ -99,6 +99,7 @@ docker run --rm --privileged=true --name=$containerName -ti \
 	--env https_proxy=$https_proxy \
 	--env CC=$PMDK_CC \
 	--env CXX=$PMDK_CXX \
+	--env PANGOLIN=$PANGOLIN \
 	--env VALGRIND=$VALGRIND \
 	--env EXTRA_CFLAGS=$EXTRA_CFLAGS \
 	--env EXTRA_CXXFLAGS=$EXTRA_CXXFLAGS \

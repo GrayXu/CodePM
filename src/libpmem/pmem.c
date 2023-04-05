@@ -182,6 +182,7 @@
 #include "os_auto_flush.h"
 
 static struct pmem_funcs Funcs;
+static struct nvsl_funcs Funcx;
 
 /*
  * pmem_has_hw_drain -- return whether or not HW drain was found
@@ -719,6 +720,7 @@ pmem_init(void)
 	LOG(3, NULL);
 
 	pmem_init_funcs(&Funcs);
+	pmem_nvsl_funcs(&Funcx);
 	pmem_os_init();
 }
 
@@ -746,4 +748,125 @@ pmem_deep_drain(const void *addr, size_t len)
 	LOG(3, "addr %p len %zu", addr, len);
 
 	return os_range_deep_common((uintptr_t)addr, len);
+}
+
+/*
+ * NVSL: Expose the clflush/clflushopt/clwb/movnt functions for testing.
+ */
+
+/*
+ * nvsl_clflush -- clflush on a virtual address range
+ */
+void
+nvsl_clflush(const void *addr, size_t len)
+{
+	/* CLFLUSH is serialized (self-fenced) */
+	Funcx.clflush_no_fence(addr, len);
+}
+
+/*
+ * nvsl_clflushopt -- clflushopt on a virtual address range
+ */
+void
+nvsl_clflushopt(const void *addr, size_t len)
+{
+	Funcx.clflushopt_no_fence(addr, len);
+	Funcx.sfence();
+}
+
+/*
+ * nvsl_clflush -- clwb on a virtual address range
+ */
+void
+nvsl_clwb(const void *addr, size_t len)
+{
+	Funcx.clwb_no_fence(addr, len);
+	Funcx.sfence();
+}
+
+/*
+ * nvsl_memmove_sse2 - memmove with 128-bit sse2 non-temporal stores
+ */
+void *
+nvsl_memmove_sse2(void *pmemdest, const void *src, size_t len)
+{
+	Funcx.memmove_fence_sse2(pmemdest, src, len, PMEM_F_MEM_NODRAIN);
+
+	return pmemdest;
+}
+
+/*
+ * nvsl_memmove_avx - memmove with 256-bit avx non-temporal stores
+ */
+void *
+nvsl_memmove_avx(void *pmemdest, const void *src, size_t len)
+{
+	Funcx.memmove_fence_avx(pmemdest, src, len, PMEM_F_MEM_NODRAIN);
+
+	return pmemdest;
+}
+
+/*
+ * nvsl_memmove_avx512f - memmove with 512-bit avx non-temporal stores
+ */
+void *
+nvsl_memmove_avx512f(void *pmemdest, const void *src, size_t len)
+{
+	Funcx.memmove_fence_avx512f(pmemdest, src, len, PMEM_F_MEM_NODRAIN);
+
+	return pmemdest;
+}
+
+/*
+ * nvsl_memcpy_sse2 - memcpy with sse2
+ */
+void
+nvsl_memcpy_sse2(char *dest, const char *src, size_t len)
+{
+	Funcx.memcpy_sse2(dest, src, len);
+}
+
+/*
+ * nvsl_memcpy_avx - memcpy with avx
+ */
+void
+nvsl_memcpy_avx(char *dest, const char *src, size_t len)
+{
+	Funcx.memcpy_avx(dest, src, len);
+}
+
+/*
+ * nvsl_memcpy_avx512f - memcpy with avx512f
+ */
+void
+nvsl_memcpy_avx512f(char *dest, const char *src, size_t len)
+{
+	Funcx.memcpy_avx512f(dest, src, len);
+}
+
+/*
+ * nvsl_memset_sse2 - memset with sse2
+ */
+void
+nvsl_memset_sse2(char *dest, int c, size_t len)
+{
+	Funcx.memset_sse2(dest, c, len);
+}
+
+/*
+ * nvsl_memset_avx - memset with avx
+ */
+void
+nvsl_memset_avx(char *dest, int c, size_t len)
+{
+	Funcx.memset_avx(dest, c, len);
+}
+
+/*
+ * nvsl_memset_avx512f - memset with avx512f
+ */
+void
+nvsl_memset_avx512f(char *dest, int c, size_t len)
+{
+	Funcx.memset_avx512f(dest, c, len);
 }

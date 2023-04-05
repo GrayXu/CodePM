@@ -53,6 +53,10 @@
 #include "out.h"
 #include "valgrind_internal.h"
 
+#ifdef PANGOLIN
+#include "pangolin.h"
+#endif
+
 /* calculates the size of the entire run, including any additional chunks */
 #define SIZEOF_RUN(runp, size_idx)\
 	(sizeof(*(runp)) + (((size_idx) - 1) * CHUNKSIZE))
@@ -129,7 +133,11 @@ memblock_header_compact_get_extra(const struct memory_block *m)
 {
 	struct allocation_header_compact *hdr = m->m_ops->get_real_data(m);
 
+#ifdef PANGOLIN
+	return hdr->extra & 0xFFFFFFFF;
+#else /* high-order 32 bits used as checksum */
 	return hdr->extra;
+#endif
 }
 
 /*
@@ -218,8 +226,20 @@ memblock_header_compact_write(const struct memory_block *m,
 		uint8_t padding[CACHELINE_SIZE - ALLOC_HDR_COMPACT_SIZE];
 	} padded;
 
+#ifdef PANGOLIN
+	/*
+	 * OBUF: padding bytes can be garbage and libpangolin doesn't want them
+	 * written to pmem.
+	 */
+	memset(&padded, 0, CACHELINE_SIZE);
+#endif
+
 	padded.hdr.size = size | ((uint64_t)flags << ALLOC_HDR_SIZE_SHIFT);
+#ifdef PANGOLIN
+	padded.hdr.extra = (CSUM0 << 32) | extra;
+#else
 	padded.hdr.extra = extra;
+#endif
 
 	struct allocation_header_compact *hdrp = m->m_ops->get_real_data(m);
 
@@ -233,6 +253,31 @@ memblock_header_compact_write(const struct memory_block *m,
 	size_t hdr_size = ALLOC_HDR_COMPACT_SIZE;
 	if ((uintptr_t)hdrp % CACHELINE_SIZE == 0 && size >= sizeof(padded))
 		hdr_size = sizeof(padded);
+
+#ifdef PANGOLIN_PARITY
+	/*
+	 * Writing an object header affects the correcponding page column's
+	 * parity consistency (for now, before the transaction commits). Parity
+	 * will be updated when committing this object. If a crash happens
+	 * before the transaction commits, this memory block should appear as
+	 * unused on restart, and its content will be zeroed out, and the
+	 * corresponding parity is re-computed using the page column's data.
+	 *
+	 * Ideally, we should write the header to an objbuf. But some code paths
+	 * use this pmem header, for example:
+	 * pmemobj_first()
+	 *   palloc_extra()
+	 *     memblock_from_offset()
+	 *
+	 * Redirect them to an objbuf requires to consult the objbuf index,
+	 * which causes unnecessary overhead.
+	 */
+	if (!(flags & OBJ_PANGOLIN_LOGS_MASK)) {
+		int err = pangolin_update_parity(m->heap->base, hdrp, &padded,
+			hdr_size);
+		ASSERTeq(err, 0);
+	}
+#endif
 
 	VALGRIND_ADD_TO_TX(hdrp, hdr_size);
 
@@ -637,6 +682,13 @@ huge_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
 	if (ctx == NULL) {
 		util_atomic_store_explicit64((uint64_t *)hdr, val,
 			memory_order_relaxed);
+#ifdef PANGOLIN_METAREP
+#ifdef PANGOLIN_CHECKSUM
+		pangolin_update_zone_csum(m->heap->base, (int64_t)m->zone_id,
+			hdr, sizeof(*hdr));
+#endif
+		pangolin_replicate_zone(m->heap->base, hdr, sizeof(*hdr));
+#endif
 		pmemops_persist(&m->heap->p_ops, hdr, sizeof(*hdr));
 	} else {
 		operation_add_entry(ctx, hdr, val, ULOG_OPERATION_SET);
@@ -670,6 +722,14 @@ huge_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
 		util_atomic_store_explicit64((uint64_t *)footer, val,
 			memory_order_relaxed);
 		VALGRIND_SET_CLEAN(footer, sizeof(*footer));
+#ifdef PANGOLIN_METAREP
+#ifdef PANGOLIN_CHECKSUM
+		pangolin_update_zone_csum(m->heap->base, (int64_t)m->zone_id,
+			footer, sizeof(*footer));
+#endif
+		/* no flush, see comments above: just needed for runtime */
+		pangolin_replicate_zone(m->heap->base, footer, sizeof(*footer));
+#endif
 	} else {
 		operation_add_typed_entry(ctx,
 			footer, val, ULOG_OPERATION_SET, LOG_TRANSIENT);
@@ -806,6 +866,14 @@ huge_ensure_header_type(const struct memory_block *m,
 		VALGRIND_ADD_TO_TX(hdr, sizeof(*hdr));
 		uint16_t f = ((uint16_t)header_type_to_flag[t]);
 		hdr->flags |= f;
+#ifdef PANGOLIN_METAREP
+#ifdef PANGOLIN_CHECKSUM
+		pangolin_update_zone_csum(m->heap->base, (int64_t)m->zone_id,
+			hdr, sizeof(*hdr));
+#endif
+		/* modifies chunk header of zone */
+		pangolin_replicate_zone(m->heap->base, hdr, sizeof(*hdr));
+#endif
 		pmemops_persist(&m->heap->p_ops, hdr, sizeof(*hdr));
 		VALGRIND_REMOVE_FROM_TX(hdr, sizeof(*hdr));
 	}
@@ -1151,7 +1219,8 @@ run_reinit_chunk(const struct memory_block *m)
  * huge_write_footer -- (internal) writes a chunk footer
  */
 static void
-huge_write_footer(struct chunk_header *hdr, uint32_t size_idx)
+huge_write_footer(struct palloc_heap *heap, uint32_t zone_id,
+	struct chunk_header *hdr, uint32_t size_idx)
 {
 	if (size_idx == 1) /* that would overwrite the header */
 		return;
@@ -1164,6 +1233,15 @@ huge_write_footer(struct chunk_header *hdr, uint32_t size_idx)
 	*(hdr + size_idx - 1) = f;
 	/* no need to persist, footers are recreated in heap_populate_buckets */
 	VALGRIND_SET_CLEAN(hdr + size_idx - 1, sizeof(f));
+
+#ifdef PANGOLIN_METAREP
+#ifdef PANGOLIN_CHECKSUM
+	pangolin_update_zone_csum(heap->base, (int64_t)zone_id,
+		hdr + size_idx - 1, sizeof(f));
+#endif
+	/* modifies chunk header of zone */
+	pangolin_replicate_zone(heap->base, hdr + size_idx - 1, sizeof(f));
+#endif
 }
 
 /*
@@ -1174,7 +1252,7 @@ huge_reinit_chunk(const struct memory_block *m)
 {
 	struct chunk_header *hdr = heap_get_chunk_hdr(m->heap, m);
 	if (hdr->type == CHUNK_TYPE_USED)
-		huge_write_footer(hdr, hdr->size_idx);
+		huge_write_footer(m->heap, m->zone_id, hdr, hdr->size_idx);
 }
 
 /*
@@ -1300,9 +1378,17 @@ memblock_huge_init(struct palloc_heap *heap,
 
 	*hdr = nhdr; /* write the entire header (8 bytes) at once */
 
+#ifdef PANGOLIN_METAREP
+#ifdef PANGOLIN_CHECKSUM
+	pangolin_update_zone_csum(heap->base, (int64_t)zone_id, hdr,
+		sizeof(*hdr));
+#endif
+	/* modifies chunk header of zone */
+	pangolin_replicate_zone(heap->base, hdr, sizeof(*hdr));
+#endif
 	pmemops_persist(&heap->p_ops, hdr, sizeof(*hdr));
 
-	huge_write_footer(hdr, size_idx);
+	huge_write_footer(heap, zone_id, hdr, size_idx);
 
 	memblock_rebuild_state(heap, &m);
 
@@ -1319,6 +1405,15 @@ memblock_run_init(struct palloc_heap *heap,
 {
 	ASSERTne(size_idx, 0);
 
+#ifdef PANGOLIN
+	/*
+	 * PGL-TODO: If alignment is non-zero, pangolin needs to make some
+	 * adjustments to its objbuf for cache line-aligned write-back.
+	 */
+	if (alignment != 0)
+		FATAL("unexpected alignment %lu", alignment);
+#endif
+
 	struct memory_block m = MEMORY_BLOCK_NONE;
 	m.chunk_id = chunk_id;
 	m.zone_id = zone_id;
@@ -1329,6 +1424,26 @@ memblock_run_init(struct palloc_heap *heap,
 
 	struct chunk_run *run = heap_get_chunk_run(heap, &m);
 	size_t runsize = SIZEOF_RUN(run, size_idx);
+
+#ifdef PANGOLIN_PARITY
+	/*
+	 * Below, run->hdr assignments, memset(b.values, ...), and
+	 * b.values[b.nvalues - 1] = ... will modify chunk run metadata as the
+	 * chunk run initialization. The corresponding parity bits should be
+	 * also be updated. The method is to save the unmodified range of
+	 * metadata in runmeta_buf, and later updating the parity using the
+	 * differences. We make runmeta_ptr cache-line aligned to ensure
+	 * alignment when using sse/avx parity functions.
+	 */
+	size_t runmeta_size = sizeof(uint64_t) * RUN_DEFAULT_METADATA_VALUES;
+	uint8_t runmeta_buf[runmeta_size + CACHELINE_SIZE];
+	void *runmeta_ptr = &runmeta_buf[0];
+	size_t misalign = (uintptr_t)runmeta_ptr & (CACHELINE_SIZE - 1);
+	if (misalign)
+		runmeta_ptr = &runmeta_buf[CACHELINE_SIZE - misalign];
+	ASSERT(ALIGNED_CL(runmeta_ptr));
+	memcpy(runmeta_ptr, run, runmeta_size);
+#endif
 
 	VALGRIND_DO_MAKE_MEM_UNDEFINED(run, runsize);
 
@@ -1343,6 +1458,15 @@ memblock_run_init(struct palloc_heap *heap,
 
 	size_t bitmap_size = b.size;
 
+#ifdef PANGOLIN
+	/*
+	 * PGL-TODO: Not using flexible chunk run bitmap now. Also see comments
+	 * in alloc_class.c on ALLOC_CLASS_DEFAULT_FLAGS.
+	 */
+	if (bitmap_size != RUN_DEFAULT_BITMAP_SIZE)
+		FATAL("unexpected bitmap_size %zu", bitmap_size);
+#endif
+
 	/* set all the bits */
 	memset(b.values, 0xFF, bitmap_size);
 
@@ -1355,6 +1479,13 @@ memblock_run_init(struct palloc_heap *heap,
 
 	VALGRIND_REMOVE_FROM_TX(run, runsize);
 
+#ifdef PANGOLIN_PARITY
+	/*
+	 * Update parity corresponding to chunk_run metadata. This function
+	 * also persists any affected parity ranges.
+	 */
+	pangolin_update_parity(heap->base, run, runmeta_ptr, runmeta_size);
+#endif
 	pmemops_flush(&heap->p_ops, run,
 		sizeof(struct chunk_run_header) +
 		bitmap_size);
@@ -1374,6 +1505,17 @@ memblock_run_init(struct palloc_heap *heap,
 		run_data_hdr.size_idx = i;
 		*data_hdr = run_data_hdr;
 	}
+#ifdef PANGOLIN_METAREP
+#ifdef PANGOLIN_CHECKSUM
+	pangolin_update_zone_csum(heap->base, (int64_t)zone_id,
+		&z->chunk_headers[chunk_id + 1],
+		sizeof(struct chunk_header) * (size_idx - 1));
+#endif
+	/* modifies chunk header of zone */
+	pangolin_replicate_zone(heap->base,
+		&z->chunk_headers[chunk_id + 1],
+		sizeof(struct chunk_header) * (size_idx - 1));
+#endif
 	pmemops_persist(&heap->p_ops,
 		&z->chunk_headers[chunk_id + 1],
 		sizeof(struct chunk_header) * (size_idx - 1));
@@ -1388,6 +1530,14 @@ memblock_run_init(struct palloc_heap *heap,
 	run_hdr.type = CHUNK_TYPE_RUN;
 	run_hdr.flags = flags;
 	*hdr = run_hdr;
+#ifdef PANGOLIN_METAREP
+#ifdef PANGOLIN_CHECKSUM
+	pangolin_update_zone_csum(heap->base, (int64_t)zone_id, hdr,
+		sizeof(*hdr));
+#endif
+	/* modifies chunk header of zone */
+	pangolin_replicate_zone(heap->base, hdr, sizeof(*hdr));
+#endif
 	pmemops_persist(&heap->p_ops, hdr, sizeof(*hdr));
 
 	VALGRIND_REMOVE_FROM_TX(&z->chunk_headers[chunk_id],

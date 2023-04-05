@@ -119,8 +119,12 @@ OBJS += $(TOP)/src/debug/libpmemobj/alloc_class.o\
 	$(TOP)/src/debug/libpmemobj/tx.o\
 	$(TOP)/src/debug/libpmemobj/stats.o
 
+OBJS += $(TOP)/src/debug/libpmemobj/objbuf.o\
+	$(TOP)/src/debug/libpmemobj/objbuf_tx.o
+
 INCS += -I$(TOP)/src/libpmemobj
 endif
+
 
 ifeq ($(LIBPMEMOBJ), internal-nondebug)
 LIBPMEM=y
@@ -146,6 +150,9 @@ OBJS += $(TOP)/src/nondebug/libpmemobj/alloc_class.o\
 	$(TOP)/src/nondebug/libpmemobj/sync.o\
 	$(TOP)/src/nondebug/libpmemobj/tx.o\
 	$(TOP)/src/nondebug/libpmemobj/stats.o
+
+OBJS += $(TOP)/src/nondebug/libpmemobj/objbuf.o\
+	$(TOP)/src/nondebug/libpmemobj/objbuf_tx.o
 
 INCS += -I$(TOP)/src/libpmemobj
 endif
@@ -426,6 +433,10 @@ objdir=.
 	$(CXX) -MD -c $(CXXFLAGS) $(INCS) $(call coverage-path, $<) -o $@
 	$(call check-os, $@, $<)
 	$(create-deps)
+
+%.i: %.c $(MAKEFILE_DEPS)
+	$(call check-cstyle, $<)
+	$(CC) -E -o $@ $(CFLAGS) $(INCS) $<
 
 %.htmp: %.h
 	$(call check-cstyle, $<, $@)

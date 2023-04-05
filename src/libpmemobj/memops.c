@@ -49,6 +49,8 @@
 #include "valgrind_internal.h"
 #include "vecq.h"
 
+#include "pangolin.h"
+
 #define ULOG_BASE_SIZE 1024
 #define OP_MERGE_SEARCH 64
 
@@ -585,4 +587,21 @@ operation_finish(struct operation_context *ctx)
 		VEC_CLEAR(&ctx->next);
 		ulog_rebuild_next_vec(ctx->ulog, &ctx->next, ctx->p_ops);
 	}
+}
+
+/*
+ * pangolin_rebuild_lane_context -- rebuild a lane's operation context
+ *
+ * This function should run if pangolin_clear_lane_ulogs() does find and free
+ * overflow ulogs, which affects the lane's ulog capacity.
+ */
+void
+pangolin_rebuild_lane_context(struct operation_context *ctx)
+{
+#ifdef PANGOLIN_PARITY
+	ctx->ulog_capacity = ulog_capacity(ctx->ulog, ctx->ulog_base_nbytes,
+		ctx->p_ops);
+	VEC_CLEAR(&ctx->next);
+	ulog_rebuild_next_vec(ctx->ulog, &ctx->next, ctx->p_ops);
+#endif
 }

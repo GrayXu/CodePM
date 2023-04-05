@@ -276,3 +276,21 @@ cuckoo_get_size(struct cuckoo *c)
 	ASSERTne(c, NULL);
 	return c->size;
 }
+
+/*
+ * cuckoo_foreach_cb -- iterate through cuckoo slots and callback to process
+ */
+void
+cuckoo_foreach_cb(struct cuckoo *c, cuckoo_slot_cb callback, int remove)
+{
+	ASSERTne(callback, NULL);
+
+	for (size_t i = 0; i < c->size; i++) {
+		struct cuckoo_slot *slot = &c->tab[i];
+		if (slot->key != 0 && slot->value != NULL) {
+			callback(slot->key, slot->value);
+			if (remove)
+				*slot = null_slot;
+		}
+	}
+}

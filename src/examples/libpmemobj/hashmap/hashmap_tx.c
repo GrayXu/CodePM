@@ -41,6 +41,7 @@
 #include "hashmap_tx.h"
 #include "hashmap_internal.h"
 
+#include <libpangolin.h>
 
 /* layout definition */
 TOID_DECLARE(struct buckets, HASHMAP_TX_TYPE_OFFSET + 1);
@@ -87,23 +88,24 @@ create_hashmap(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint32_t seed)
 	size_t sz = sizeof(struct buckets) +
 			len * sizeof(TOID(struct entry));
 
-	TX_BEGIN(pop) {
-		TX_ADD(hashmap);
+	PGL_TX_BEGIN(pop) {
+		struct hashmap_tx *hmap = pgl_tx_open(hashmap.oid);
 
-		D_RW(hashmap)->seed = seed;
+		hmap->seed = seed;
 		do {
-			D_RW(hashmap)->hash_fun_a = (uint32_t)rand();
-		} while (D_RW(hashmap)->hash_fun_a == 0);
-		D_RW(hashmap)->hash_fun_b = (uint32_t)rand();
-		D_RW(hashmap)->hash_fun_p = HASH_FUNC_COEFF_P;
+			hmap->hash_fun_a = (uint32_t)rand();
+		} while (hmap->hash_fun_a == 0);
+		hmap->hash_fun_b = (uint32_t)rand();
+		hmap->hash_fun_p = HASH_FUNC_COEFF_P;
 
-		D_RW(hashmap)->buckets = TX_ZALLOC(struct buckets, sz);
-		D_RW(D_RW(hashmap)->buckets)->nbuckets = len;
-	} TX_ONABORT {
-		fprintf(stderr, "%s: transaction aborted: %s\n", __func__,
-			pmemobj_errormsg());
+		struct buckets *bkts = pgl_tx_alloc_open_shared(sz,
+					TOID_TYPE_NUM(struct buckets));
+		hmap->buckets = (TOID(struct buckets))pgl_oid(bkts);
+		bkts->nbuckets = len;
+	} PGL_TX_ONABORT {
+		fprintf(stderr, "%s: transaction aborted\n", __func__);
 		abort();
-	} TX_END
+	} PGL_TX_END
 }
 
 /*
@@ -111,13 +113,12 @@ create_hashmap(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint32_t seed)
  * see https://en.wikipedia.org/wiki/Universal_hashing#Hashing_integers
  */
 static uint64_t
-hash(const TOID(struct hashmap_tx) *hashmap,
-	const TOID(struct buckets) *buckets, uint64_t value)
+hash(struct hashmap_tx *hmap, struct buckets *bkts, uint64_t value)
 {
-	uint32_t a = D_RO(*hashmap)->hash_fun_a;
-	uint32_t b = D_RO(*hashmap)->hash_fun_b;
-	uint64_t p = D_RO(*hashmap)->hash_fun_p;
-	size_t len = D_RO(*buckets)->nbuckets;
+	uint32_t a = hmap->hash_fun_a;
+	uint32_t b = hmap->hash_fun_b;
+	uint64_t p = hmap->hash_fun_p;
+	size_t len = bkts->nbuckets;
 
 	return ((a * value + b) % p) % len;
 }
@@ -128,50 +129,43 @@ hash(const TOID(struct hashmap_tx) *hashmap,
 static void
 hm_tx_rebuild(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, size_t new_len)
 {
-	TOID(struct buckets) buckets_old = D_RO(hashmap)->buckets;
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
+
+	TOID(struct buckets) buckets_old = hmap->buckets;
+	struct buckets *bkts_old = pgl_open_shared(buckets_old.oid);
 
 	if (new_len == 0)
-		new_len = D_RO(buckets_old)->nbuckets;
+		new_len = bkts_old->nbuckets;
 
-	size_t sz_old = sizeof(struct buckets) +
-			D_RO(buckets_old)->nbuckets *
-			sizeof(TOID(struct entry));
 	size_t sz_new = sizeof(struct buckets) +
 			new_len * sizeof(TOID(struct entry));
 
-	TX_BEGIN(pop) {
-		TX_ADD_FIELD(hashmap, buckets);
-		TOID(struct buckets) buckets_new =
-				TX_ZALLOC(struct buckets, sz_new);
-		D_RW(buckets_new)->nbuckets = new_len;
-		pmemobj_tx_add_range(buckets_old.oid, 0, sz_old);
+	PGL_TX_BEGIN(pop) {
+		hmap = pgl_tx_add(hmap);
+		struct buckets *bkts_new = pgl_tx_alloc_open_shared(sz_new,
+						TOID_TYPE_NUM(struct buckets));
+		bkts_new->nbuckets = new_len;
 
-		for (size_t i = 0; i < D_RO(buckets_old)->nbuckets; ++i) {
-			while (!TOID_IS_NULL(D_RO(buckets_old)->bucket[i])) {
-				TOID(struct entry) en =
-					D_RO(buckets_old)->bucket[i];
-				uint64_t h = hash(&hashmap, &buckets_new,
-						D_RO(en)->key);
+		bkts_old = pgl_tx_add_shared(bkts_old);
 
-				D_RW(buckets_old)->bucket[i] = D_RO(en)->next;
+		for (size_t i = 0; i < bkts_old->nbuckets; ++i) {
+			while (!TOID_IS_NULL(bkts_old->bucket[i])) {
+				TOID(struct entry) en = bkts_old->bucket[i];
+				struct entry *pen = pgl_tx_open(en.oid);
+				uint64_t h = hash(hmap, bkts_new, pen->key);
 
-				TX_ADD_FIELD(en, next);
-				D_RW(en)->next = D_RO(buckets_new)->bucket[h];
-				D_RW(buckets_new)->bucket[h] = en;
+				bkts_old->bucket[i] = pen->next;
+
+				pen->next = bkts_new->bucket[h];
+				bkts_new->bucket[h] = en;
 			}
 		}
 
-		D_RW(hashmap)->buckets = buckets_new;
-		TX_FREE(buckets_old);
-	} TX_ONABORT {
-		fprintf(stderr, "%s: transaction aborted: %s\n", __func__,
-			pmemobj_errormsg());
-		/*
-		 * We don't need to do anything here, because everything is
-		 * consistent. The only thing affected is performance.
-		 */
-	} TX_END
-
+		hmap->buckets = (TOID(struct buckets))pgl_oid(bkts_new);
+		pgl_tx_free(buckets_old.oid);
+	} PGL_TX_ONABORT {
+		fprintf(stderr, "%s: transaction aborted\n", __func__);
+	} PGL_TX_END
 }
 
 /*
@@ -185,46 +179,55 @@ int
 hm_tx_insert(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 	uint64_t key, PMEMoid value)
 {
-	TOID(struct buckets) buckets = D_RO(hashmap)->buckets;
-	TOID(struct entry) var;
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
 
-	uint64_t h = hash(&hashmap, &buckets, key);
+	TOID(struct buckets) buckets = hmap->buckets;
+	struct buckets *bkts = pgl_open_shared(buckets.oid);
+
+	uint64_t h = hash(hmap, bkts, key);
 	int num = 0;
 
-	for (var = D_RO(buckets)->bucket[h];
-			!TOID_IS_NULL(var);
-			var = D_RO(var)->next) {
-		if (D_RO(var)->key == key)
+	TOID(struct entry) var;
+	struct entry *pvar = NULL;
+
+	for (var = bkts->bucket[h]; !TOID_IS_NULL(var); var = pvar->next) {
+		pvar = pgl_get(var.oid);
+		if (pvar->key == key)
 			return 1;
+
 		num++;
 	}
 
 	int ret = 0;
-	TX_BEGIN(pop) {
-		TX_ADD_FIELD(D_RO(hashmap)->buckets, bucket[h]);
-		TX_ADD_FIELD(hashmap, count);
+	uint64_t count = hmap->count;
+	size_t nbuckets = bkts->nbuckets;
+	PGL_TX_BEGIN(pop) {
+		hmap = pgl_tx_add(hmap);
+		bkts = pgl_tx_add_range_shared(bkts,
+				offsetof(struct buckets, bucket[h]),
+				sizeof(PMEMoid));
 
-		TOID(struct entry) e = TX_NEW(struct entry);
-		D_RW(e)->key = key;
-		D_RW(e)->value = value;
-		D_RW(e)->next = D_RO(buckets)->bucket[h];
-		D_RW(buckets)->bucket[h] = e;
+		struct entry *e = pgl_tx_alloc_open(sizeof(struct entry),
+						TOID_TYPE_NUM(struct entry));
+		e->key = key;
+		e->value = value;
+		e->next = bkts->bucket[h];
+		bkts->bucket[h] = (TOID(struct entry))pgl_oid(e);
 
-		D_RW(hashmap)->count++;
+		count += 1;
+		hmap->count = count;
 		num++;
-	} TX_ONABORT {
-		fprintf(stderr, "transaction aborted: %s\n",
-			pmemobj_errormsg());
+	} PGL_TX_ONABORT {
+		fprintf(stderr, "transaction aborted\n");
 		ret = -1;
-	} TX_END
+	} PGL_TX_END
 
 	if (ret)
 		return ret;
 
 	if (num > MAX_HASHSET_THRESHOLD ||
-			(num > MIN_HASHSET_THRESHOLD &&
-			D_RO(hashmap)->count > 2 * D_RO(buckets)->nbuckets))
-		hm_tx_rebuild(pop, hashmap, D_RO(buckets)->nbuckets * 2);
+		(num > MIN_HASHSET_THRESHOLD && count > 2 * nbuckets))
+		hm_tx_rebuild(pop, hashmap, nbuckets * 2);
 
 	return 0;
 }
@@ -238,46 +241,57 @@ hm_tx_insert(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 PMEMoid
 hm_tx_remove(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint64_t key)
 {
-	TOID(struct buckets) buckets = D_RO(hashmap)->buckets;
-	TOID(struct entry) var, prev = TOID_NULL(struct entry);
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
 
-	uint64_t h = hash(&hashmap, &buckets, key);
-	for (var = D_RO(buckets)->bucket[h];
-			!TOID_IS_NULL(var);
-			prev = var, var = D_RO(var)->next) {
-		if (D_RO(var)->key == key)
+	TOID(struct buckets) buckets = hmap->buckets;
+	struct buckets *bkts = pgl_open_shared(buckets.oid);
+
+	uint64_t h = hash(hmap, bkts, key);
+
+	TOID(struct entry) var, prev = TOID_NULL(struct entry);
+	struct entry *pvar = NULL, *pprev = NULL;
+
+	for (var = bkts->bucket[h]; !TOID_IS_NULL(var);
+			prev = var, var = pvar->next) {
+		pvar = pgl_get(var.oid);
+		if (pvar->key == key)
 			break;
 	}
 
 	if (TOID_IS_NULL(var))
 		return OID_NULL;
+
 	int ret = 0;
+	PMEMoid retoid = pvar->value;
+	size_t nbuckets = bkts->nbuckets;
 
-	PMEMoid retoid = D_RO(var)->value;
-	TX_BEGIN(pop) {
-		if (TOID_IS_NULL(prev))
-			TX_ADD_FIELD(D_RO(hashmap)->buckets, bucket[h]);
-		else
-			TX_ADD_FIELD(prev, next);
-		TX_ADD_FIELD(hashmap, count);
+	PGL_TX_BEGIN(pop) {
+		if (TOID_IS_NULL(prev)) {
+			bkts = pgl_tx_add_range_shared(bkts,
+					offsetof(struct buckets, bucket[h]),
+					sizeof(PMEMoid));
+		} else {
+			pprev = pgl_tx_open(prev.oid);
+		}
+		hmap = pgl_tx_add(hmap);
 
-		if (TOID_IS_NULL(prev))
-			D_RW(buckets)->bucket[h] = D_RO(var)->next;
-		else
-			D_RW(prev)->next = D_RO(var)->next;
-		D_RW(hashmap)->count--;
-		TX_FREE(var);
-	} TX_ONABORT {
-		fprintf(stderr, "transaction aborted: %s\n",
-			pmemobj_errormsg());
+		if (TOID_IS_NULL(prev)) {
+			bkts->bucket[h] = pvar->next;
+		} else {
+			pprev->next = pvar->next;
+		}
+		hmap->count--;
+		pgl_tx_free(var.oid);
+	} PGL_TX_ONABORT {
+		fprintf(stderr, "transaction aborted\n");
 		ret = -1;
-	} TX_END
+	} PGL_TX_END
 
 	if (ret)
 		return OID_NULL;
 
-	if (D_RO(hashmap)->count < D_RO(buckets)->nbuckets)
-		hm_tx_rebuild(pop, hashmap, D_RO(buckets)->nbuckets / 2);
+	if (hmap->count < nbuckets)
+		hm_tx_rebuild(pop, hashmap, nbuckets / 2);
 
 	return retoid;
 }
@@ -289,21 +303,35 @@ int
 hm_tx_foreach(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 	int (*cb)(uint64_t key, PMEMoid value, void *arg), void *arg)
 {
-	TOID(struct buckets) buckets = D_RO(hashmap)->buckets;
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
+	TOID(struct buckets) buckets = hmap->buckets;
 	TOID(struct entry) var;
 
+	struct buckets *bkts = pgl_open_shared(buckets.oid);
+	struct entry *pvar = NULL;
+
 	int ret = 0;
-	for (size_t i = 0; i < D_RO(buckets)->nbuckets; ++i) {
-		if (TOID_IS_NULL(D_RO(buckets)->bucket[i]))
+	for (size_t i = 0; i < bkts->nbuckets; ++i) {
+		if (TOID_IS_NULL(bkts->bucket[i]))
 			continue;
 
-		for (var = D_RO(buckets)->bucket[i]; !TOID_IS_NULL(var);
-				var = D_RO(var)->next) {
-			ret = cb(D_RO(var)->key, D_RO(var)->value, arg);
+		for (var = bkts->bucket[i]; !TOID_IS_NULL(var);
+				var = pvar->next) {
+			pvar = pgl_get(var.oid);
+			ret = cb(pvar->key, pvar->value, arg);
 			if (ret)
 				break;
 		}
 	}
+
+	/*
+	 * OBUF: This is the only place we close buckets' objbuf. In practice
+	 * this close operation can be performed whenever the buckets is no
+	 * longer used. If this foreach function is never called, libpangolin
+	 * will remove and free this objbuf when program exits. The data_store
+	 * program calls foreach seveval times, but map_bench doesn't.
+	 */
+	pgl_close_shared(pop, bkts);
 
 	return ret;
 }
@@ -314,27 +342,8 @@ hm_tx_foreach(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 static void
 hm_tx_debug(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, FILE *out)
 {
-	TOID(struct buckets) buckets = D_RO(hashmap)->buckets;
-	TOID(struct entry) var;
-
-	fprintf(out, "a: %u b: %u p: %" PRIu64 "\n", D_RO(hashmap)->hash_fun_a,
-		D_RO(hashmap)->hash_fun_b, D_RO(hashmap)->hash_fun_p);
-	fprintf(out, "count: %" PRIu64 ", buckets: %zu\n",
-		D_RO(hashmap)->count, D_RO(buckets)->nbuckets);
-
-	for (size_t i = 0; i < D_RO(buckets)->nbuckets; ++i) {
-		if (TOID_IS_NULL(D_RO(buckets)->bucket[i]))
-			continue;
-
-		int num = 0;
-		fprintf(out, "%zu: ", i);
-		for (var = D_RO(buckets)->bucket[i]; !TOID_IS_NULL(var);
-				var = D_RO(var)->next) {
-			fprintf(out, "%" PRIu64 " ", D_RO(var)->key);
-			num++;
-		}
-		fprintf(out, "(%d)\n", num);
-	}
+	/* OBUF: This looks not used in evaluation. */
+	fprintf(stderr, "%s not implemented with libpangolin\n", __func__);
 }
 
 /*
@@ -343,18 +352,26 @@ hm_tx_debug(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, FILE *out)
 PMEMoid
 hm_tx_get(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint64_t key)
 {
-	TOID(struct buckets) buckets = D_RO(hashmap)->buckets;
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
+
+	TOID(struct buckets) buckets = hmap->buckets;
+	struct buckets *bkts = pgl_open_shared(buckets.oid);
+
+	uint64_t h = hash(hmap, bkts, key);
+
 	TOID(struct entry) var;
+	struct entry *pvar = NULL;
 
-	uint64_t h = hash(&hashmap, &buckets, key);
+	PMEMoid retoid = OID_NULL;
+	for (var = bkts->bucket[h]; !TOID_IS_NULL(var); var = pvar->next) {
+		pvar = pgl_get(var.oid);
+		if (pvar->key == key) {
+			retoid = pvar->value;
+			break;
+		}
+	}
 
-	for (var = D_RO(buckets)->bucket[h];
-			!TOID_IS_NULL(var);
-			var = D_RO(var)->next)
-		if (D_RO(var)->key == key)
-			return D_RO(var)->value;
-
-	return OID_NULL;
+	return retoid;
 }
 
 /*
@@ -363,18 +380,26 @@ hm_tx_get(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint64_t key)
 int
 hm_tx_lookup(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint64_t key)
 {
-	TOID(struct buckets) buckets = D_RO(hashmap)->buckets;
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
+
+	TOID(struct buckets) buckets = hmap->buckets;
+	struct buckets *bkts = pgl_open_shared(buckets.oid);
+
+	uint64_t h = hash(hmap, bkts, key);
+
 	TOID(struct entry) var;
+	struct entry *pvar = NULL;
 
-	uint64_t h = hash(&hashmap, &buckets, key);
+	int found = 0;
+	for (var = bkts->bucket[h]; !TOID_IS_NULL(var); var = pvar->next) {
+		pvar = pgl_get(var.oid);
+		if (pvar->key == key) {
+			found = 1;
+			break;
+		}
+	}
 
-	for (var = D_RO(buckets)->bucket[h];
-			!TOID_IS_NULL(var);
-			var = D_RO(var)->next)
-		if (D_RO(var)->key == key)
-			return 1;
-
-	return 0;
+	return found;
 }
 
 /*
@@ -383,7 +408,10 @@ hm_tx_lookup(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint64_t key)
 size_t
 hm_tx_count(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap)
 {
-	return D_RO(hashmap)->count;
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
+	size_t count = hmap->count;
+
+	return count;
 }
 
 /*
@@ -392,7 +420,9 @@ hm_tx_count(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap)
 int
 hm_tx_init(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap)
 {
-	srand(D_RO(hashmap)->seed);
+	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
+	srand(hmap->seed);
+
 	return 0;
 }
 
@@ -404,15 +434,15 @@ hm_tx_create(PMEMobjpool *pop, TOID(struct hashmap_tx) *map, void *arg)
 {
 	struct hashmap_args *args = (struct hashmap_args *)arg;
 	int ret = 0;
-	TX_BEGIN(pop) {
-		TX_ADD_DIRECT(map);
-		*map = TX_ZNEW(struct hashmap_tx);
+
+	PGL_TX_BEGIN(pop) {
+		*map = PGL_TX_ZNEW(struct hashmap_tx);
 
 		uint32_t seed = args ? args->seed : 0;
 		create_hashmap(pop, *map, seed);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = -1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }

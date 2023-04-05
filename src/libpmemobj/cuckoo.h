@@ -53,6 +53,9 @@ void *cuckoo_remove(struct cuckoo *c, uint64_t key);
 void *cuckoo_get(struct cuckoo *c, uint64_t key);
 size_t cuckoo_get_size(struct cuckoo *c);
 
+typedef void cuckoo_slot_cb(uint64_t key, void *value);
+void cuckoo_foreach_cb(struct cuckoo *c, cuckoo_slot_cb cb, int remove);
+
 #ifdef __cplusplus
 }
 #endif

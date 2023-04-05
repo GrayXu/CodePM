@@ -65,6 +65,10 @@
 #include "sys_util.h"
 #include "palloc.h"
 
+#ifdef PANGOLIN_PARITY
+#include "pangolin.h"
+#endif
+
 struct pobj_action_internal {
 	/* type of operation (alloc/free vs set) */
 	enum pobj_action_type type;
@@ -137,6 +141,19 @@ alloc_prep_block(struct palloc_heap *heap, const struct memory_block *m,
 	VALGRIND_DO_MEMPOOL_ALLOC(heap->layout, uptr, usize);
 	VALGRIND_DO_MAKE_MEM_UNDEFINED(uptr, usize);
 	VALGRIND_ANNOTATE_NEW_MEMORY(uptr, usize);
+
+#ifdef PANGOLIN_PARITY
+	if (object_flags & OBJ_PANGOLIN_LOGS_MASK) {
+		/*
+		 * This action is required since a ulog block will be zeroed
+		 * before performing corruption recovery.
+		 */
+		if (!util_is_zeroed(REAL(uptr), OHDR_SIZE + usize)) {
+			pangolin_update_parity(heap->base, REAL(uptr), NULL,
+				OHDR_SIZE + usize);
+		}
+	}
+#endif
 
 	m->m_ops->write_header(m, extra_field, object_flags);
 
@@ -673,6 +690,28 @@ palloc_operation(struct palloc_heap *heap,
 	if (off != 0) {
 		dealloc = &ops[nops++];
 		palloc_defer_free_create(heap, off, dealloc);
+
+#ifdef PANGOLIN_PARITY
+		/*
+		 * We need to zero-fill a freed heap allocation that was used
+		 * for holding extended logs, because they do not participate in
+		 * parity updating (also see memblock_header_compact_write).
+		 *
+		 * If it crashes before finishing this memset, we will zero out
+		 * all non-allocated memory blocks on reboot and recompute
+		 * parity.
+		 */
+		void *pobj = HEAP_OFF_TO_PTR(heap, off);
+		void *real_data = REAL(pobj);
+		size_t size = OHDR(pobj)->size;
+		size_t logmask = OBJ_PANGOLIN_LOGS_MASK << ALLOC_HDR_SIZE_SHIFT;
+
+		if (size & logmask) /* if true, it is an extended log */
+			pmemops_memset(&heap->p_ops, real_data, 0,
+				size & ALLOC_HDR_FLAGS_MASK,
+				PMEMOBJ_F_RELAXED | PMEMOBJ_F_MEM_NODRAIN);
+#endif
+
 		user_size = dealloc->m.m_ops->get_user_size(&dealloc->m);
 		if (user_size == size) {
 			operation_cancel(ctx);

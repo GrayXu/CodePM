@@ -128,6 +128,22 @@ void *pmem_memmove(void *pmemdest, const void *src, size_t len, unsigned flags);
 void *pmem_memcpy(void *pmemdest, const void *src, size_t len, unsigned flags);
 void *pmem_memset(void *pmemdest, int c, size_t len, unsigned flags);
 
+/* NVSL: Expose the flush/wb/movnt functions for latency evaluations. */
+void nvsl_clflush(const void *addr, size_t len);
+void nvsl_clflushopt(const void *addr, size_t len);
+void nvsl_clwb(const void *addr, size_t len);
+void *nvsl_memmove_sse2(void *pmemdest, const void *src, size_t len);
+void *nvsl_memmove_avx(void *pmemdest, const void *src, size_t len);
+void *nvsl_memmove_avx512f(void *pmemdest, const void *src, size_t len);
+
+void nvsl_memcpy_sse2(char *dest, const char *src, size_t len);
+void nvsl_memcpy_avx(char *dest, const char *src, size_t len);
+void nvsl_memcpy_avx512f(char *dest, const char *src, size_t len);
+
+void nvsl_memset_sse2(char *dest, int c, size_t len);
+void nvsl_memset_avx(char *dest, int c, size_t len);
+void nvsl_memset_avx512f(char *dest, int c, size_t len);
+
 /*
  * PMEM_MAJOR_VERSION and PMEM_MINOR_VERSION provide the current version of the
  * libpmem API as provided by this header file.  Applications can verify that

@@ -69,12 +69,32 @@ extern "C" {
 
 #ifdef DEBUG
 
+#define PCRST "\x1B[0m"
+#define PCBLK "\x1B[1m\x1B[30m"
+#define PCRED "\x1B[1m\x1B[31m"
+#define PCGRN "\x1B[1m\x1B[32m"
+#define PCYLW "\x1B[1m\x1B[33m"
+#define PCBLU "\x1B[1m\x1B[34m"
+#define PCMGT "\x1B[1m\x1B[35m"
+#define PCCYN "\x1B[1m\x1B[36m"
+#define PCWHT "\x1B[1m\x1B[37m"
+
 #define OUT_LOG out_log
 #define OUT_NONL out_nonl
 #define OUT_FATAL out_fatal
 #define OUT_FATAL_ABORT out_fatal
 
 #else
+
+#define PCRST
+#define PCBLK
+#define PCRED
+#define PCGRN
+#define PCYLW
+#define PCBLU
+#define PCMGT
+#define PCCYN
+#define PCWHT
 
 static __attribute__((always_inline)) inline void
 out_log_discard(const char *file, int line, const char *func, int level,
@@ -150,6 +170,16 @@ out_fatal_abort(const char *file, int line, const char *func,
 	if (!EVALUATE_DBG_EXPRESSIONS) break; \
 	OUT_NONL(level, __VA_ARGS__); \
 } while (0)
+
+/* produce colorized debug/trace output */
+#define LOG_RED(level, fmt, ...) LOG(level, PCRED fmt PCRST, __VA_ARGS__)
+#define LOG_GRN(level, fmt, ...) LOG(level, PCGRN fmt PCRST, __VA_ARGS__)
+#define LOG_YLW(level, fmt, ...) LOG(level, PCYLW fmt PCRST, __VA_ARGS__)
+#define LOG_BLU(level, fmt, ...) LOG(level, PCBLU fmt PCRST, __VA_ARGS__)
+#define LOG_MGT(level, fmt, ...) LOG(level, PCMGT fmt PCRST, __VA_ARGS__)
+#define LOG_CYN(level, fmt, ...) LOG(level, PCCYN fmt PCRST, __VA_ARGS__)
+
+#define LOG_ERR(...) LOG(0, __VA_ARGS__)
 
 /* produce output and exit */
 #define FATAL(...)\

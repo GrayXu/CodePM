@@ -104,10 +104,14 @@ base_dir=utils/docker/$images_dir_name
 
 # Check if committed file modifications require the Docker image to be rebuilt
 for file in $files; do
+
+	# NVSL: Always rebuild docker images because we may depend on extra
+	# libraries than PMDK's default installed ones, for example libnuma.
+
 	# Check if modified files are relevant to the current build
-	if [[ $file =~ ^($base_dir)\/Dockerfile\.($OS)-($OS_VER)$ ]] \
-		|| [[ $file =~ ^($base_dir)\/.*\.sh$ ]]
-	then
+#	if [[ $file =~ ^($base_dir)\/Dockerfile\.($OS)-($OS_VER)$ ]] \
+#		|| [[ $file =~ ^($base_dir)\/.*\.sh$ ]]
+#	then
 		# Rebuild Docker image for the current OS version
 		echo "Rebuilding the Docker image for the Dockerfile.$OS-$OS_VER"
 		pushd $images_dir_name
@@ -136,7 +140,7 @@ for file in $files; do
 			touch skip_build_package_check
 		fi
 		exit 0
-	fi
+#	fi
 done
 
 # Getting here means rebuilding the Docker image is not required.

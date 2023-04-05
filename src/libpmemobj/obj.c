@@ -57,6 +57,11 @@
 #include "tx.h"
 #include "sys_util.h"
 
+#ifdef PANGOLIN
+#include "pangolin.h"
+#include "objbuf_tx.h"
+#endif
+
 /*
  * The variable from which the config is directly loaded. The string
  * cannot contain any comments or extraneous white characters.
@@ -345,6 +350,7 @@ obj_fini(void)
 		cuckoo_delete(pools_ht);
 	if (pools_tree)
 		ravl_delete(pools_tree);
+
 	lane_info_destroy();
 	util_remote_fini();
 
@@ -918,12 +924,22 @@ obj_descr_create(PMEMobjpool *pop, const char *layout, size_t poolsize)
 	pop->lanes_offset = OBJ_LANES_OFFSET;
 	pop->nlanes = OBJ_NLANES;
 
+#if defined(PANGOLIN_METAREP) || defined(PANGOLIN_LOGREP)
+	pop->lanes_offset += MREP_SIZE;
+#endif
+
 	/* zero all lanes */
 	lane_init_data(pop);
 
 	pop->heap_offset = pop->lanes_offset +
 		pop->nlanes * sizeof(struct lane_layout);
+
+#if defined(PANGOLIN_METAREP) || defined(PANGOLIN_LOGREP)
+	/* should be already aligned with the padding bytes in MREP_SIZE */
+	ASSERTeq(pop->heap_offset, HEAP_OFFSET);
+#else
 	pop->heap_offset = (pop->heap_offset + Pagesize - 1) & ~(Pagesize - 1);
+#endif
 
 	size_t heap_size = pop->set->poolsize - pop->heap_offset;
 
@@ -936,6 +952,12 @@ obj_descr_create(PMEMobjpool *pop, const char *layout, size_t poolsize)
 	}
 
 	util_checksum(dscp, OBJ_DSC_P_SIZE, &pop->checksum, 1, 0);
+
+#if defined(PANGOLIN_METAREP) || defined(PANGOLIN_LOGREP)
+	/* replicate the persistent part of (struct pmemobjpool) */
+	void *dscprep = (char *)dscp + MREP_SIZE;
+	pmemops_memcpy(p_ops, dscprep, dscp, OBJ_DSC_P_SIZE, 0);
+#endif
 
 	/*
 	 * store the persistent part of pool's descriptor (2kB)
@@ -1226,6 +1248,20 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 
 	pop->uuid_lo = pmemobj_get_uuid_lo(pop);
 
+#ifdef PANGOLIN
+	/*
+	 * PGL-OPT: For efficient objbuf lookup, use a 16-bit pool UUID and
+	 * 48-bit in-pool offset as a key. This gives 64K concurrent pools in
+	 * one application, which is more than enough for our evaluations. For a
+	 * more practical implementation, we can take advantage of object
+	 * alignment to cut the least significant bits of an OID's offset, and
+	 * so make more bits for the pool's UUID.
+	 *
+	 * The hex value is for "UUIDLO".
+	 */
+	pop->uuid_lo = (pop->uuid_lo & (0xFFFFUL << 48)) | 0x4f4c44495555;
+#endif
+
 	pop->lanes_desc.runtime_nlanes = nlanes;
 
 	pop->tx_params = tx_params_new();
@@ -1247,6 +1283,13 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 	pop->cond_head = NULL;
 
 	if (boot) {
+#ifdef PANGOLIN
+		if ((errno = obuf_create_runtime(pop)) != 0) {
+			ERR("!obuf_create_runtime");
+			goto err_boot;
+		}
+#endif
+
 		if ((errno = obj_runtime_init_common(pop)) != 0)
 			goto err_boot;
 
@@ -1260,6 +1303,16 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 #endif
 
 		obj_pool_init();
+
+#ifdef PANGOLIN
+		/*
+		 * PGL-OPT: Using a short uuid_lo might cause two different
+		 * pools sharing the same uuid_lo, but it should not happen
+		 * during our evaluations because we mostly use a single pool or
+		 * poolset.
+		 */
+		ASSERTeq(cuckoo_get(pools_ht, pop->uuid_lo), NULL);
+#endif
 
 		if ((errno = cuckoo_insert(pools_ht, pop->uuid_lo, pop)) != 0) {
 			ERR("!cuckoo_insert");
@@ -1276,6 +1329,11 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 		errno = EINVAL;
 		goto err_ctl;
 	}
+
+#ifdef PANGOLIN_METAREP
+	void *poprep = (char *)pop + MREP_SIZE;
+	pmemops_memcpy(&pop->p_ops, poprep, pop, sizeof(struct pmemobjpool), 0);
+#endif
 
 	/*
 	 * If possible, turn off all permissions on the pool header page.
@@ -1969,6 +2027,12 @@ pmemobj_close(PMEMobjpool *pop)
 
 	_pobj_cache_invalidate++;
 
+#ifdef PANGOLIN
+	if (obuf_destroy_runtime(pop) != 0) {
+		ERR("obuf_destroy_runtime");
+	}
+#endif
+
 	if (cuckoo_remove(pools_ht, pop->uuid_lo) != pop) {
 		ERR("cuckoo_remove");
 	}
@@ -2354,6 +2418,33 @@ constructor_realloc(void *ctx, void *ptr, size_t usable_size, void *arg)
 
 		pmemops_memset(p_ops, new_data_ptr, 0, grow_len, 0);
 	}
+
+#ifdef PANGOLIN_CHECKSUM
+	/*
+	 * PGL-TODO: This is a workaround for the root object, which is not
+	 * created using objbuf. We should provide an API to create a root
+	 * object with objbuf.
+	 */
+	ASSERTeq(OHDR(ptr)->csum, CSUM0);
+
+#ifdef PANGOLIN_PARITY
+	struct objhdr ohdr = { /* old header for parity update */
+		.size = OHDR(ptr)->size,
+		.extra = OHDR(ptr)->extra
+	};
+#endif
+
+	OHDR(ptr)->csum = pangolin_adler32(CSUM0, ptr, USIZE(ptr));
+
+#ifdef PANGOLIN_PARITY
+	int err = pangolin_update_parity(pop, REAL(ptr), &ohdr, OHDR_SIZE);
+	if (err != 0) {
+		LOG_ERR("pangolin parity update for the root object failed");
+		return EINVAL;
+	}
+#endif
+
+#endif
 
 	return 0;
 }

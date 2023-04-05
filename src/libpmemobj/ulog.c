@@ -39,9 +39,12 @@
 
 #include "libpmemobj.h"
 #include "ulog.h"
+#include "obj.h"
 #include "out.h"
 #include "util.h"
 #include "valgrind_internal.h"
+
+#include "pangolin.h"
 
 /*
  * Operation flag at the three most significant bits
@@ -153,18 +156,41 @@ ulog_entry_valid(const struct ulog_entry_base *entry)
 /*
  * ulog_construct -- initializes the ulog structure
  */
+#ifndef PANGOLIN_LOGREP
 void
 ulog_construct(uint64_t offset, size_t capacity, int flush,
 	const struct pmem_ops *p_ops)
+#else
+void
+ulog_construct(uint64_t offset, size_t capacity, int flush, int extended,
+	const struct pmem_ops *p_ops)
+#endif
 {
 	struct ulog *ulog = ulog_by_offset(offset, p_ops);
 	ASSERTne(ulog, NULL);
 
 	VALGRIND_ADD_TO_TX(ulog, SIZEOF_ULOG(capacity));
 
+#ifdef PANGOLIN_LOGREP
+	size_t main_size = capacity;
+	PMEMobjpool *pop = (PMEMobjpool *)p_ops->base;
+	if (extended) {
+		/* this is an extended ulog construction */
+		main_size = pop->tx_params->cache_size;
+		if (capacity < main_size * 2) {
+			FATAL("capacity %zu < main_size * 2 %zu",
+				capacity, main_size * 2);
+		}
+	}
+	ulog->capacity = main_size;
+#else
 	ulog->capacity = capacity;
+#endif
 	ulog->checksum = 0;
 	ulog->next = 0;
+#ifdef PANGOLIN
+	ulog->replay = 0;
+#endif
 	memset(ulog->unused, 0, sizeof(ulog->unused));
 
 	if (flush) {
@@ -181,6 +207,29 @@ ulog_construct(uint64_t offset, size_t capacity, int flush,
 		 */
 		memset(ulog->data, 0, capacity);
 	}
+
+#ifdef PANGOLIN_LOGREP
+	void *ulogrep = pangolin_repaddr(pop, ulog);
+	size_t repsize = SIZEOF_ULOG(capacity); /* for in-lane ulogs */
+	if (extended) { /* in-heap ulog */
+		/*
+		 * When constructing an extended ulog (allocated in-heap), its
+		 * content is already zero-filled with the call to
+		 * pmemops_memset() above. We only need to replicate the
+		 * capacity value.
+		 */
+		repsize = sizeof(*ulog);
+	}
+
+	if (flush) {
+		pmemops_memcpy(p_ops, ulogrep, ulog, repsize,
+			PMEMOBJ_F_MEM_NONTEMPORAL |
+			PMEMOBJ_F_MEM_NODRAIN |
+			PMEMOBJ_F_RELAXED);
+	} else {
+		memcpy(ulogrep, ulog, repsize);
+	}
+#endif
 
 	VALGRIND_REMOVE_FROM_TX(ulog, SIZEOF_ULOG(capacity));
 }
@@ -338,6 +387,16 @@ ulog_store(struct ulog *dest, struct ulog *src, size_t nbytes,
 			PMEMOBJ_F_MEM_WC |
 			PMEMOBJ_F_MEM_NODRAIN |
 			PMEMOBJ_F_RELAXED);
+#ifdef PANGOLIN_LOGREP
+		struct ulog *ulogrep = pangolin_repaddr(p_ops->base, ulog);
+		pmemops_memcpy(p_ops,
+			ulogrep->data,
+			src->data + offset,
+			copy_nbytes,
+			PMEMOBJ_F_MEM_WC |
+			PMEMOBJ_F_MEM_NODRAIN |
+			PMEMOBJ_F_RELAXED);
+#endif
 		VALGRIND_REMOVE_FROM_TX(ulog->data, copy_nbytes);
 		offset += copy_nbytes;
 	}
@@ -352,6 +411,14 @@ ulog_store(struct ulog *dest, struct ulog *src, size_t nbytes,
 	src->next = VEC_SIZE(next) == 0 ? 0 : VEC_FRONT(next);
 	ulog_checksum(src, checksum_nbytes, 1);
 
+#ifdef PANGOLIN_LOGREP
+	void *destrep = pangolin_repaddr(p_ops->base, dest);
+	pmemops_memcpy(p_ops, destrep, src,
+		SIZEOF_ULOG(base_nbytes),
+		PMEMOBJ_F_MEM_WC |
+		PMEMOBJ_F_MEM_NODRAIN |
+		PMEMOBJ_F_RELAXED);
+#endif
 	pmemops_memcpy(p_ops, dest, src,
 		SIZEOF_ULOG(base_nbytes),
 		PMEMOBJ_F_MEM_WC);
@@ -386,6 +453,12 @@ ulog_entry_val_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 	data.v.base.offset = (uint64_t)(dest) - (uint64_t)p_ops->base;
 	data.v.base.offset |= ULOG_OPERATION(type);
 	data.v.value = value;
+
+#ifdef PANGOLIN_LOGREP
+	void *erep = pangolin_repaddr(p_ops->base, e);
+	pmemops_memcpy(p_ops, erep, &data, sizeof(data),
+		PMEMOBJ_F_MEM_NOFLUSH | PMEMOBJ_F_RELAXED);
+#endif
 
 	pmemops_memcpy(p_ops, e, &data, sizeof(data),
 		PMEMOBJ_F_MEM_NOFLUSH | PMEMOBJ_F_RELAXED);
@@ -425,6 +498,11 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 	b->size = size;
 	b->checksum = 0;
 
+	/*
+	 * PGL-OPT: We might be able to avoid copies around alloca() and
+	 * last_cacheline[] by leveraging the cache line alignment of an objbuf.
+	 */
+
 	size_t bdatasize = CACHELINE_SIZE - sizeof(struct ulog_entry_buf);
 	size_t ncopy = MIN(size, bdatasize);
 	memcpy(b->data, src, ncopy);
@@ -450,6 +528,11 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 		pmemops_memcpy(p_ops, dest, srcof, rcopy,
 			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
 		VALGRIND_REMOVE_FROM_TX(dest, rcopy);
+#ifdef PANGOLIN_LOGREP
+		void *destrep = pangolin_repaddr(p_ops->base, dest);
+		pmemops_memcpy(p_ops, destrep, srcof, rcopy,
+			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+#endif
 	}
 
 	if (lcopy != 0) {
@@ -460,6 +543,11 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 		pmemops_memcpy(p_ops, dest, last_cacheline, CACHELINE_SIZE,
 			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
 		VALGRIND_REMOVE_FROM_TX(dest, CACHELINE_SIZE);
+#ifdef PANGOLIN_LOGREP
+		void *destrep = pangolin_repaddr(p_ops->base, dest);
+		pmemops_memcpy(p_ops, destrep, last_cacheline, CACHELINE_SIZE,
+			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+#endif
 	}
 
 	b->checksum = util_checksum_seq(b, CACHELINE_SIZE, 0);
@@ -476,7 +564,21 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 		PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
 	VALGRIND_REMOVE_FROM_TX(e, CACHELINE_SIZE);
 
+#ifdef PANGOLIN_LOGREP
+	void *erep = pangolin_repaddr(p_ops->base, e);
+	pmemops_memcpy(p_ops, erep, b, CACHELINE_SIZE,
+		PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+#endif
+
+#ifndef PANGOLIN
+	/*
+	 * An objbuf transaction does not have to drain (sfence) every log
+	 * entry, because it uses redo logging and it is fine to drain after all
+	 * log entries are copied to pmem. We call pmemops_drain() after
+	 * obuf_tx_log_commit().
+	 */
 	pmemops_drain(p_ops);
+#endif
 
 	ASSERT(ulog_entry_valid(&e->base));
 
@@ -501,12 +603,61 @@ ulog_entry_apply(const struct ulog_entry_base *e, int persist,
 
 	flush_fn f = persist ? p_ops->persist : p_ops->flush;
 
+#ifdef PANGOLIN
+	/*
+	 * In the current implementation of libpmemobj/pangolin:
+	 *
+	 * ULOG_OPERATION_AND and ULOG_OPERATION_OR only modify chunk_run's hdr
+	 * or bitmap, and parity data should reflect the changes.
+	 *
+	 * ULOG_OPERATION_SET does not modify chunk_run's bitmap. It could
+	 * modify heap metadata, log data, or user data via the following paths,
+	 * and it should not affect parity.
+	 *
+	 *   1. Function huge_prep_operation_hdr(), to modify a zone's
+	 *   chunk_headers for huge allocation/free. This is handled by metadata
+	 *   replication.
+	 *
+	 *   2. Function palloc_set_value(). This only affects lane area, for
+	 *   invalidating logs. This is handled by metadata replication.
+	 *
+	 *   3. Function pmalloc_construct() via lane_undo_extend() or
+	 *   lane_redo_extend(), to extend allocations for excessive logging.
+	 *   ULOG_OPERATION_SET in this case only modifies log data, which do
+	 *   not affect parity.
+	 *
+	 *   4. Functions pmalloc(), prealloc(), pfree() in pmalloc.c. Pangolin
+	 *   only uses pfree() for clearing all logs, and ULOG_OPERATION_SET in
+	 *   this case only affects log data.
+	 *
+	 *   5. Function obj_alloc_root() in obj.c for root object. This
+	 *   modifies &pop->root_size, handled by metadata replication.
+	 *
+	 *   6. Functions obj_alloc_construct() and obj_free() in obj.c.
+	 *   Pangolin does not use or allow them.
+	 *
+	 *   7. Functions in list.c. Pangolin doesn't use or allow them.
+	 *
+	 * ULOG_OPERATION_BUF_CPY will be used for applying user's logs during
+	 * crash recovery or libpmemobj's abort (see tx_undo_entry_apply).
+	 *
+	 * ULOG_OPERATION_BUF_SET is not used in the current implementation.
+	 */
+#endif
+
+#ifdef PANGOLIN_PARITY
+	uint64_t dstval = *dst;
+#endif
+
 	switch (t) {
 		case ULOG_OPERATION_AND:
 			ev = (struct ulog_entry_val *)e;
-
 			VALGRIND_ADD_TO_TX(dst, dst_size);
 			*dst &= ev->value;
+#ifdef PANGOLIN_PARITY
+			pangolin_update_parity(p_ops->base, dst, &dstval,
+				sizeof(uint64_t));
+#endif
 			f(p_ops->base, dst, sizeof(uint64_t),
 				PMEMOBJ_F_RELAXED);
 		break;
@@ -515,6 +666,10 @@ ulog_entry_apply(const struct ulog_entry_base *e, int persist,
 
 			VALGRIND_ADD_TO_TX(dst, dst_size);
 			*dst |= ev->value;
+#ifdef PANGOLIN_PARITY
+			pangolin_update_parity(p_ops->base, dst, &dstval,
+				sizeof(uint64_t));
+#endif
 			f(p_ops->base, dst, sizeof(uint64_t),
 				PMEMOBJ_F_RELAXED);
 		break;
@@ -523,6 +678,22 @@ ulog_entry_apply(const struct ulog_entry_base *e, int persist,
 
 			VALGRIND_ADD_TO_TX(dst, dst_size);
 			*dst = ev->value;
+#if defined(PANGOLIN_METAREP) || defined(PANGOLIN_LOGREP)
+#ifdef PANGOLIN_CHECKSUM
+			if (pangolin_ptoloc(p_ops->base, dst) == PTO_ZONE_META)
+				pangolin_update_zone_csum(p_ops->base, -1, dst,
+					sizeof(uint64_t));
+#endif
+			void *dstrep = pangolin_repaddr(p_ops->base, dst);
+			pmemops_memcpy(p_ops, dstrep, dst, sizeof(uint64_t),
+				PMEMOBJ_F_RELAXED);
+			/*
+			 * PGL-NOTE: If this is user data, we should handle
+			 * parity update. But Pangolin should not have a case
+			 * for this to be user data, which must go through
+			 * objbuf.
+			 */
+#endif
 			f(p_ops->base, dst, sizeof(uint64_t),
 				PMEMOBJ_F_RELAXED);
 		break;
@@ -575,6 +746,11 @@ ulog_clobber(struct ulog *dest, struct ulog_next *next,
 	else
 		empty.next = dest->next;
 
+#ifdef PANGOLIN_LOGREP
+	void *destrep = pangolin_repaddr(p_ops->base, dest);
+	pmemops_memcpy(p_ops, destrep, &empty, sizeof(empty),
+		PMEMOBJ_F_MEM_WC | PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_RELAXED);
+#endif
 	pmemops_memcpy(p_ops, dest, &empty, sizeof(empty),
 		PMEMOBJ_F_MEM_WC);
 }
@@ -595,6 +771,12 @@ ulog_clobber_data(struct ulog *dest,
 	for (struct ulog *r = dest; r != NULL; ) {
 		size_t nzero = MIN(nbytes, rcapacity);
 		VALGRIND_ADD_TO_TX(r->data, nzero);
+#ifdef PANGOLIN_LOGREP
+		void *datarep = pangolin_repaddr(p_ops->base, r->data);
+		pmemops_memset(p_ops, datarep, 0, nzero,
+			PMEMOBJ_F_MEM_WC |
+			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_RELAXED);
+#endif
 		pmemops_memset(p_ops, r->data, 0, nzero, PMEMOBJ_F_MEM_WC);
 		VALGRIND_ADD_TO_TX(r->data, nzero);
 		nbytes -= nzero;

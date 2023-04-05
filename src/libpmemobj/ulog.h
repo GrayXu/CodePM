@@ -70,6 +70,7 @@ struct ulog_entry_buf {
  * the next field is always allocated with extra padding, and then the offset
  * is additionally aligned.
  */
+#ifndef PANGOLIN
 #define ULOG(capacity_bytes) {\
 	/* 64 bytes of metadata */\
 	uint64_t checksum; /* checksum of ulog header and its entries */\
@@ -77,7 +78,18 @@ struct ulog_entry_buf {
 	uint64_t capacity; /* capacity of this ulog in bytes */\
 	uint64_t unused[5]; /* must be 0 */\
 	uint8_t data[capacity_bytes]; /* N bytes of data */\
-}\
+}
+#else
+#define ULOG(capacity_bytes) {\
+	/* 64 bytes of metadata */\
+	uint64_t checksum; /* checksum of ulog header and its entries */\
+	uint64_t next; /* offset of ulog extension */\
+	uint64_t capacity; /* capacity of this ulog in bytes */\
+	uint64_t replay; /* (Pangolin) if the whole chain redo-log is valid */\
+	uint64_t unused[4]; /* must be 0 */\
+	uint8_t data[capacity_bytes]; /* N bytes of data */\
+}
+#endif
 
 #define SIZEOF_ULOG(base_capacity)\
 (sizeof(struct ulog) + base_capacity)
@@ -108,8 +120,13 @@ typedef void (*ulog_free_fn)(void *base, uint64_t *next);
 
 struct ulog *ulog_next(struct ulog *ulog, const struct pmem_ops *p_ops);
 
+#ifndef PANGOLIN_LOGREP
 void ulog_construct(uint64_t offset, size_t capacity, int flush,
 	const struct pmem_ops *p_ops);
+#else
+void ulog_construct(uint64_t offset, size_t capacity, int flush, int extended,
+	const struct pmem_ops *p_ops);
+#endif
 
 size_t ulog_capacity(struct ulog *ulog, size_t ulog_base_bytes,
 	const struct pmem_ops *p_ops);

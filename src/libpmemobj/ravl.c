@@ -120,6 +120,18 @@ ravl_clear(struct ravl *ravl)
 	ravl->root = NULL;
 }
 
+#ifdef PANGOLIN
+/*
+ * ravl_clear_cb -- clears the entire tree with callback, starting from the root
+ */
+void
+ravl_clear_cb(struct ravl *ravl, ravl_cb cb, void *arg)
+{
+	ravl_clear_node(ravl->root, cb, arg);
+	ravl->root = NULL;
+}
+#endif
+
 /*
  * ravl_delete_cb -- clears and deletes the given ravl instance, calls callback
  */

@@ -41,6 +41,8 @@
 
 #include "ctree_map.h"
 
+#include <libpangolin.h>
+
 #define BIT_IS_SET(n, i) (!!((n) & (1ULL << (i))))
 
 TOID_DECLARE(struct tree_map_node, CTREE_MAP_TYPE_OFFSET + 1);
@@ -76,12 +78,16 @@ ctree_map_create(PMEMobjpool *pop, TOID(struct ctree_map) *map, void *arg)
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		pmemobj_tx_add_range_direct(map, sizeof(*map));
-		*map = TX_ZNEW(struct ctree_map);
-	} TX_ONABORT {
+	PGL_TX_BEGIN(pop) {
+		/*
+		 * We do not have to add *map to a transaction (again) because
+		 * if map points to a pmem object, the target should reside in
+		 * an objbuf that is created and committed by the caller.
+		 */
+		*map = PGL_TX_ZNEW(struct ctree_map);
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -96,14 +102,12 @@ ctree_map_clear_node(PMEMoid p)
 		return;
 
 	if (OID_INSTANCEOF(p, struct tree_map_node)) {
-		TOID(struct tree_map_node) node;
-		TOID_ASSIGN(node, p);
-
-		ctree_map_clear_node(D_RW(node)->entries[0].slot);
-		ctree_map_clear_node(D_RW(node)->entries[1].slot);
+		struct tree_map_node *node = pgl_get(p);
+		ctree_map_clear_node(node->entries[0].slot);
+		ctree_map_clear_node(node->entries[1].slot);
 	}
 
-	pmemobj_tx_free(p);
+	pgl_tx_free(p);
 }
 
 
@@ -113,11 +117,11 @@ ctree_map_clear_node(PMEMoid p)
 int
 ctree_map_clear(PMEMobjpool *pop, TOID(struct ctree_map) map)
 {
-	TX_BEGIN(pop) {
-		ctree_map_clear_node(D_RW(map)->root.slot);
-		TX_ADD_FIELD(map, root);
-		D_RW(map)->root.slot = OID_NULL;
-	} TX_END
+	PGL_TX_BEGIN(pop) {
+		struct ctree_map *cmap = pgl_tx_open(map.oid);
+		ctree_map_clear_node(cmap->root.slot);
+		cmap->root.slot = OID_NULL;
+	} PGL_TX_END
 
 	return 0;
 }
@@ -129,14 +133,13 @@ int
 ctree_map_destroy(PMEMobjpool *pop, TOID(struct ctree_map) *map)
 {
 	int ret = 0;
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
 		ctree_map_clear(pop, *map);
-		pmemobj_tx_add_range_direct(map, sizeof(*map));
-		TX_FREE(*map);
+		pgl_tx_free(map->oid);
 		*map = TOID_NULL(struct ctree_map);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -148,32 +151,42 @@ static void
 ctree_map_insert_leaf(struct tree_map_entry *p,
 	struct tree_map_entry e, int diff)
 {
-	TOID(struct tree_map_node) new_node = TX_NEW(struct tree_map_node);
-	D_RW(new_node)->diff = diff;
+	struct tree_map_node *new_node = pgl_tx_alloc_open(
+		sizeof(struct tree_map_node),
+		TOID_TYPE_NUM(struct tree_map_node));
+	new_node->diff = diff;
 
-	int d = BIT_IS_SET(e.key, D_RO(new_node)->diff);
+	int d = BIT_IS_SET(e.key, new_node->diff);
 
 	/* insert the leaf at the direction based on the critical bit */
-	D_RW(new_node)->entries[d] = e;
+	new_node->entries[d] = e;
 
 	/* find the appropriate position in the tree to insert the node */
-	TOID(struct tree_map_node) node;
+	struct tree_map_node *node = NULL, *next = NULL;
 	while (OID_INSTANCEOF(p->slot, struct tree_map_node)) {
-		TOID_ASSIGN(node, p->slot);
 
+		next = pgl_get(p->slot);
 		/* the critical bits have to be sorted */
-		if (D_RO(node)->diff < D_RO(new_node)->diff)
+		if (next->diff < new_node->diff)
 			break;
 
-		p = &D_RW(node)->entries[BIT_IS_SET(e.key, D_RO(node)->diff)];
+		SWAP_PTR(node, next);
+		p = &node->entries[BIT_IS_SET(e.key, node->diff)];
 	}
 
 	/* insert the found destination in the other slot */
-	D_RW(new_node)->entries[!d] = *p;
+	new_node->entries[!d] = *p;
 
-	pmemobj_tx_add_range_direct(p, sizeof(*p));
+	/*
+	 * In CoW mode node was pointing to pmem, so was p. This step is to
+	 * reset p to node's objbuf after it's added to transaction. It's not
+	 * necessary in non-CoW mode.
+	 */
+	if (PTR_TO_OBJ(p, node, struct tree_map_node))
+		p = PTR_TO(pgl_tx_add(node), DISP(node, p));
+
 	p->key = 0;
-	p->slot = new_node.oid;
+	p->slot = pgl_oid(new_node);
 }
 
 /*
@@ -187,13 +200,13 @@ ctree_map_insert_new(PMEMobjpool *pop, TOID(struct ctree_map) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		PMEMoid n = pmemobj_tx_alloc(size, type_num);
-		constructor(pop, pmemobj_direct(n), arg);
-		ctree_map_insert(pop, map, key, n);
-	} TX_ONABORT {
+	PGL_TX_BEGIN(pop) {
+		void *pn = pgl_tx_alloc_open(size, type_num);
+		constructor(pop, pn, arg);
+		ctree_map_insert(pop, map, key, pgl_oid(pn));
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -206,29 +219,36 @@ int
 ctree_map_insert(PMEMobjpool *pop, TOID(struct ctree_map) map,
 	uint64_t key, PMEMoid value)
 {
-	struct tree_map_entry *p = &D_RW(map)->root;
 	int ret = 0;
+	struct ctree_map *cmap = pgl_get(map.oid);
+	struct tree_map_entry *p = &cmap->root;
 
 	/* descend the path until a best matching key is found */
-	TOID(struct tree_map_node) node;
+	struct tree_map_node *node = NULL;
 	while (!OID_IS_NULL(p->slot) &&
 		OID_INSTANCEOF(p->slot, struct tree_map_node)) {
-		TOID_ASSIGN(node, p->slot);
-		p = &D_RW(node)->entries[BIT_IS_SET(key, D_RW(node)->diff)];
+		node = pgl_get(p->slot);
+		p = &node->entries[BIT_IS_SET(key, node->diff)];
 	}
 
 	struct tree_map_entry e = {key, value};
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
+		cmap = pgl_tx_add(cmap);
+
+		if (PTR_TO_OBJ(p, node, struct tree_map_node))
+			p = PTR_TO(pgl_tx_add(node), DISP(node, p));
+		else
+			p = &cmap->root;
+
 		if (p->key == 0 || p->key == key) {
-			pmemobj_tx_add_range_direct(p, sizeof(*p));
 			*p = e;
 		} else {
-			ctree_map_insert_leaf(&D_RW(map)->root, e,
+			ctree_map_insert_leaf(&cmap->root, e,
 					find_crit_bit(p->key, key));
 		}
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -237,24 +257,31 @@ ctree_map_insert(PMEMobjpool *pop, TOID(struct ctree_map) map,
  * ctree_map_get_leaf -- (internal) searches for a leaf of the key
  */
 static struct tree_map_entry *
-ctree_map_get_leaf(TOID(struct ctree_map) map, uint64_t key,
-	struct tree_map_entry **parent)
+ctree_map_get_leaf(struct ctree_map *map, uint64_t key,
+	struct tree_map_entry **parent, struct tree_map_node **retnode,
+	struct tree_map_node **retparent)
 {
-	struct tree_map_entry *n = &D_RW(map)->root;
+	struct tree_map_entry *n = &map->root;
 	struct tree_map_entry *p = NULL;
 
-	TOID(struct tree_map_node) node;
+	struct tree_map_node *node = NULL, *parentnode = NULL;
 	while (!OID_IS_NULL(n->slot) &&
 				OID_INSTANCEOF(n->slot, struct tree_map_node)) {
-		TOID_ASSIGN(node, n->slot);
 
+		SWAP_PTR(node, parentnode);
 		p = n;
-		n = &D_RW(node)->entries[BIT_IS_SET(key, D_RW(node)->diff)];
+
+		node = pgl_get(n->slot);
+		n = &node->entries[BIT_IS_SET(key, node->diff)];
 	}
 
 	if (n->key == key) {
 		if (parent)
 			*parent = p;
+
+		/* must provide receivers so as to close them after use */
+		*retnode = node;
+		*retparent = parentnode;
 
 		return n;
 	}
@@ -271,12 +298,12 @@ ctree_map_remove_free(PMEMobjpool *pop, TOID(struct ctree_map) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
 		PMEMoid val = ctree_map_remove(pop, map, key);
-		pmemobj_tx_free(val);
-	} TX_ONABORT {
+		pgl_tx_free(val);
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -288,18 +315,41 @@ PMEMoid
 ctree_map_remove(PMEMobjpool *pop, TOID(struct ctree_map) map, uint64_t key)
 {
 	struct tree_map_entry *parent = NULL;
-	struct tree_map_entry *leaf = ctree_map_get_leaf(map, key, &parent);
+	struct ctree_map *cmap = pgl_get(map.oid);
+	struct tree_map_node *leafnode = NULL, *parentnode = NULL;
+	struct tree_map_entry *leaf = ctree_map_get_leaf(cmap, key, &parent,
+							&leafnode, &parentnode);
+
 	if (leaf == NULL)
 		return OID_NULL;
 
 	PMEMoid ret = leaf->slot;
 
 	if (parent == NULL) { /* root */
-		TX_BEGIN(pop) {
-			pmemobj_tx_add_range_direct(leaf, sizeof(*leaf));
+		/* only modifying leaf, parent and its node not needed */
+		PGL_TX_BEGIN(pop) {
+			if (PTR_TO_OBJ(leaf, leafnode, struct tree_map_node)) {
+				leaf = PTR_TO(pgl_tx_add(leafnode),
+						DISP(leafnode, leaf));
+			} else {
+				cmap = pgl_tx_add(cmap);
+				leaf = &cmap->root;
+			}
+
+			/*
+			 * OBUF-OPT: Struct ctree_map only has a tree_map_entry.
+			 * The leaf pointer returned by ctree_map_get_leaf() can
+			 * point to ctree_map if that is the only thing in the
+			 * tree, but then leafnode is NULL since ctree_map is
+			 * not a tree_map_node. Thus we have the if branch to
+			 * add map to transaction because the following leaf->
+			 * operations modify it.
+			 *
+			 * The same principle applies to the parent pointer.
+			 */
 			leaf->key = 0;
 			leaf->slot = OID_NULL;
-		} TX_END
+		} PGL_TX_END
 	} else {
 		/*
 		 * In this situation:
@@ -309,16 +359,28 @@ ctree_map_remove(PMEMobjpool *pop, TOID(struct ctree_map) map, uint64_t key)
 		 * there's no point in leaving the parent internal node
 		 * so it's swapped with the remaining node and then also freed.
 		 */
-		TX_BEGIN(pop) {
-			struct tree_map_entry *dest = parent;
-			TOID(struct tree_map_node) node;
-			TOID_ASSIGN(node, parent->slot);
-			pmemobj_tx_add_range_direct(dest, sizeof(*dest));
-			*dest = D_RW(node)->entries[
-				D_RO(node)->entries[0].key == leaf->key];
+		PGL_TX_BEGIN(pop) {
+			if (PTR_TO_OBJ(parent, parentnode,
+					struct tree_map_node)) {
+				parent = PTR_TO(pgl_tx_add(parentnode),
+						DISP(parentnode, parent));
+			} else {
+				cmap = pgl_tx_add(cmap);
+				parent = &cmap->root;
+			}
 
-			TX_FREE(node);
-		} TX_END
+			struct tree_map_entry *dest = parent;
+
+			PMEMoid noid = parent->slot;
+			struct tree_map_node *node = pgl_get(noid);
+			*dest = node->entries[
+				node->entries[0].key == leaf->key];
+			/*
+			 * Need to close the obejct if it was opened in unque
+			 * mode and not added to a transaction.
+			 */
+			pgl_tx_free(noid);
+		} PGL_TX_END
 	}
 
 	return ret;
@@ -330,7 +392,11 @@ ctree_map_remove(PMEMobjpool *pop, TOID(struct ctree_map) map, uint64_t key)
 PMEMoid
 ctree_map_get(PMEMobjpool *pop, TOID(struct ctree_map) map, uint64_t key)
 {
-	struct tree_map_entry *entry = ctree_map_get_leaf(map, key, NULL);
+	struct ctree_map *cmap = pgl_get(map.oid);
+	struct tree_map_node *leafnode = NULL, *parentnode = NULL;
+	struct tree_map_entry *entry = ctree_map_get_leaf(cmap, key, NULL,
+							&leafnode, &parentnode);
+
 	return entry ? entry->slot : OID_NULL;
 }
 
@@ -341,7 +407,11 @@ int
 ctree_map_lookup(PMEMobjpool *pop, TOID(struct ctree_map) map,
 		uint64_t key)
 {
-	struct tree_map_entry *entry = ctree_map_get_leaf(map, key, NULL);
+	struct ctree_map *cmap = pgl_get(map.oid);
+	struct tree_map_node *leafnode = NULL, *parentnode = NULL;
+	struct tree_map_entry *entry = ctree_map_get_leaf(cmap, key, NULL,
+							&leafnode, &parentnode);
+
 	return entry != NULL;
 }
 
@@ -355,12 +425,9 @@ ctree_map_foreach_node(struct tree_map_entry e,
 	int ret = 0;
 
 	if (OID_INSTANCEOF(e.slot, struct tree_map_node)) {
-		TOID(struct tree_map_node) node;
-		TOID_ASSIGN(node, e.slot);
-
-		if (ctree_map_foreach_node(D_RO(node)->entries[0],
-					cb, arg) == 0)
-			ctree_map_foreach_node(D_RO(node)->entries[1], cb, arg);
+		struct tree_map_node *node = pgl_get(e.slot);
+		if (ctree_map_foreach_node(node->entries[0], cb, arg) == 0)
+			ctree_map_foreach_node(node->entries[1], cb, arg);
 	} else { /* leaf */
 		ret = cb(e.key, e.slot, arg);
 	}
@@ -375,10 +442,13 @@ int
 ctree_map_foreach(PMEMobjpool *pop, TOID(struct ctree_map) map,
 	int (*cb)(uint64_t key, PMEMoid value, void *arg), void *arg)
 {
-	if (OID_IS_NULL(D_RO(map)->root.slot))
+	struct ctree_map *cmap = pgl_get(map.oid);
+	if (OID_IS_NULL(cmap->root.slot))
 		return 0;
 
-	return ctree_map_foreach_node(D_RO(map)->root, cb, arg);
+	int ret = ctree_map_foreach_node(cmap->root, cb, arg);
+
+	return ret;
 }
 
 /*
@@ -387,7 +457,10 @@ ctree_map_foreach(PMEMobjpool *pop, TOID(struct ctree_map) map,
 int
 ctree_map_is_empty(PMEMobjpool *pop, TOID(struct ctree_map) map)
 {
-	return D_RO(map)->root.key == 0;
+	struct ctree_map *cmap = pgl_get(map.oid);
+	int empty = cmap->root.key == 0;
+
+	return empty;
 }
 
 /*

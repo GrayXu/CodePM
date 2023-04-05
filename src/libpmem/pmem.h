@@ -55,6 +55,8 @@ typedef void *(*memmove_nodrain_func)(void *pmemdest, const void *src,
 		size_t len, unsigned flags);
 typedef void *(*memset_nodrain_func)(void *pmemdest, int c, size_t len,
 		unsigned flags);
+typedef void (*memcpy_func)(char *dest, const char *src, size_t len);
+typedef void (*memset_func)(char *dest, int c, size_t len);
 
 struct pmem_funcs {
 	predrain_fence_func predrain_fence;
@@ -65,9 +67,30 @@ struct pmem_funcs {
 	flush_func deep_flush;
 };
 
+struct nvsl_funcs {
+	flush_func clflush_no_fence;
+	flush_func clflushopt_no_fence;
+	flush_func clwb_no_fence;
+
+	predrain_fence_func sfence;
+
+	memmove_nodrain_func memmove_fence_sse2;
+	memmove_nodrain_func memmove_fence_avx;
+	memmove_nodrain_func memmove_fence_avx512f;
+
+	memcpy_func memcpy_sse2;
+	memcpy_func memcpy_avx;
+	memcpy_func memcpy_avx512f;
+
+	memset_func memset_sse2;
+	memset_func memset_avx;
+	memset_func memset_avx512f;
+};
+
 void pmem_init(void);
 void pmem_os_init(void);
 void pmem_init_funcs(struct pmem_funcs *funcs);
+void pmem_nvsl_funcs(struct nvsl_funcs *funcx);
 
 int is_pmem_detect(const void *addr, size_t len);
 void *pmem_map_register(int fd, size_t len, const char *path, int is_dev_dax);

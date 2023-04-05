@@ -138,14 +138,26 @@ struct chunk_header {
 };
 
 struct zone_header {
+#ifdef PANGOLIN_CHECKSUM
+	uint32_t checksum;
+	uint32_t chkstart;
+#endif
 	uint32_t magic;
 	uint32_t size_idx;
+#ifdef PANGOLIN_CHECKSUM
+	uint8_t reserved[48];
+#else
 	uint8_t reserved[56];
+#endif
 };
 
 struct zone {
 	struct zone_header header;
 	struct chunk_header chunk_headers[MAX_CHUNK];
+#ifdef PANGOLIN_METAREP
+	struct zone_header rephdr;
+	struct chunk_header chunk_rephdrs[MAX_CHUNK];
+#endif
 	struct chunk chunks[];
 };
 
@@ -156,7 +168,12 @@ struct heap_header {
 	uint64_t unused; /* might be garbage */
 	uint64_t chunksize;
 	uint64_t chunks_per_zone;
+#ifdef PANGOLIN_METAREP
+	/* making it a whole page */
+	uint8_t reserved[4032];
+#else
 	uint8_t reserved[960];
+#endif
 	uint64_t checksum;
 };
 

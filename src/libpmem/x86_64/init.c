@@ -506,3 +506,71 @@ pmem_init_funcs(struct pmem_funcs *funcs)
 	else
 		FATAL("invalid memcpy impl");
 }
+
+#if !(SSE2_AVAILABLE && AVX_AVAILABLE && AVX512F_AVAILABLE)
+/*
+ * memmove_unavailable - fallback for unavailable memmove functions
+ */
+static void *
+memmove_unavailable(void *pmemdest, const void *src, size_t len, unsigned flags)
+{
+	FATAL("function unavailable");
+
+	return NULL;
+}
+#endif
+
+/*
+ * pmem_nvsl_funcs -- expose functions for performance testing
+ */
+void
+pmem_nvsl_funcs(struct nvsl_funcs *funcx)
+{
+	LOG(3, NULL);
+
+	funcx->clflush_no_fence = flush_clflush;
+	funcx->clflushopt_no_fence = flush_clflushopt;
+	funcx->clwb_no_fence = flush_clwb;
+
+	funcx->sfence = predrain_memory_barrier;
+
+	/*
+	 * In memmove_nodrain_sse2_clflush/clflushopt/clwb functions, only
+	 * unaligned or small data sizes use clflush/clflushopt/clwb. We ignore
+	 * these marginal cases for now and only test the following no flush/wb
+	 * versions (_empty).
+	 *
+	 * These memmove_nodrain_* functions are already sfenced in their
+	 * implementation in libpmem/x86_64/memcpy.
+	 */
+
+#if SSE2_AVAILABLE
+	funcx->memmove_fence_sse2 = memmove_nodrain_sse2_empty;
+	funcx->memcpy_sse2 = memmove_mov_sse2_empty;
+	funcx->memset_sse2 = memset_mov_sse2_empty;
+#else
+	funcx->memmove_fence_sse2 = memmove_unavailable;
+	funcx->memcpy_sse2 = NULL;
+	funcx->memset_sse2 = NULL;
+#endif
+
+#if AVX_AVAILABLE
+	funcx->memmove_fence_avx = memmove_nodrain_avx_empty;
+	funcx->memcpy_avx = memmove_mov_avx_empty;
+	funcx->memset_avx = memset_mov_avx_empty;
+#else
+	funcx->memmove_fence_avx = memmove_unavailable;
+	funcx->memcpy_avx = NULL;
+	funcx->memset_avx = NULL;
+#endif
+
+#if AVX512F_AVAILABLE
+	funcx->memmove_fence_avx512f = memmove_nodrain_avx512f_empty;
+	funcx->memcpy_avx512f = memmove_mov_avx512f_empty;
+	funcx->memset_avx512f = memset_mov_avx512f_empty;
+#else
+	funcx->memmove_fence_avx512f = memmove_unavailable;
+	funcx->memcpy_avx512f = NULL;
+	funcx->memset_avx512f = NULL;
+#endif
+}

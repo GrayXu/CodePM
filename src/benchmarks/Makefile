@@ -80,6 +80,8 @@ SRC=pmembench.cpp\
     map_bench.cpp\
     pmemobj_tx.cpp\
     pmemobj_atomic_lists.cpp\
+    ops_bench.cpp\
+    cache_bench.cpp\
     poolset_util.cpp
 
 # Configuration file without the .cfg extension
@@ -107,10 +109,12 @@ LDFLAGS += -L../examples/libpmemobj/map
 LDFLAGS += $(EXTRA_LDFLAGS)
 ifeq ($(DEBUG),)
 LIBS += ../nondebug/libpmemcommon.a
+LDFLAGS += -Wl,-rpath=../nondebug
 else
 LIBS += ../debug/libpmemcommon.a
+LDFLAGS += -Wl,-rpath=../debug
 endif
-LIBS += -lpmemobj -lpmemlog -lpmemblk -lpmempool -lpmem -lvmem -pthread -lm \
+LIBS += -lpmemobj -lpmemlog -lpmemblk -lpmempool -lpmem -lvmem -pthread -lm -lnuma \
 	$(LIBDL) $(LIBUUID) $(LIBNDCTL)
 ifeq ($(LIBRT_NEEDED), y)
 LIBS += -lrt

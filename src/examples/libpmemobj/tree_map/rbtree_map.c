@@ -36,7 +36,10 @@
 
 #include <assert.h>
 #include <errno.h>
+
 #include "rbtree_map.h"
+
+#include <libpangolin.h>
 
 TOID_DECLARE(struct tree_map_node, RBTREE_MAP_TYPE_OFFSET + 1);
 
@@ -101,27 +104,40 @@ int
 rbtree_map_create(PMEMobjpool *pop, TOID(struct rbtree_map) *map, void *arg)
 {
 	int ret = 0;
-	TX_BEGIN(pop) {
-		pmemobj_tx_add_range_direct(map, sizeof(*map));
-		*map = TX_ZNEW(struct rbtree_map);
 
-		TOID(struct tree_map_node) s = TX_ZNEW(struct tree_map_node);
-		D_RW(s)->color = COLOR_BLACK;
-		D_RW(s)->parent = s;
-		D_RW(s)->slots[RB_LEFT] = s;
-		D_RW(s)->slots[RB_RIGHT] = s;
+	PGL_TX_BEGIN(pop) {
+		struct rbtree_map *rbmap = pgl_tx_alloc_open(
+					sizeof(struct rbtree_map),
+					TOID_TYPE_NUM(struct rbtree_map));
+		*map = (TOID(struct rbtree_map))pgl_oid(rbmap);
 
-		TOID(struct tree_map_node) r = TX_ZNEW(struct tree_map_node);
-		D_RW(r)->color = COLOR_BLACK;
-		D_RW(r)->parent = s;
-		D_RW(r)->slots[RB_LEFT] = s;
-		D_RW(r)->slots[RB_RIGHT] = s;
+		struct tree_map_node *ps = pgl_tx_alloc_open(
+					sizeof(struct tree_map_node),
+					TOID_TYPE_NUM(struct tree_map_node));
+		TOID(struct tree_map_node) s =
+				(TOID(struct tree_map_node))pgl_oid(ps);
 
-		D_RW(*map)->sentinel = s;
-		D_RW(*map)->root = r;
-	} TX_ONABORT {
+		ps->color = COLOR_BLACK;
+		ps->parent = s;
+		ps->slots[RB_LEFT] = s;
+		ps->slots[RB_RIGHT] = s;
+
+		struct tree_map_node *pr = pgl_tx_alloc_open(
+					sizeof(struct tree_map_node),
+					TOID_TYPE_NUM(struct tree_map_node));
+		TOID(struct tree_map_node) r =
+				(TOID(struct tree_map_node))pgl_oid(pr);
+
+		pr->color = COLOR_BLACK;
+		pr->parent = s;
+		pr->slots[RB_LEFT] = s;
+		pr->slots[RB_RIGHT] = s;
+
+		rbmap->sentinel = s;
+		rbmap->root = r;
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -132,17 +148,19 @@ rbtree_map_create(PMEMobjpool *pop, TOID(struct rbtree_map) *map, void *arg)
 static void
 rbtree_map_clear_node(TOID(struct rbtree_map) map, TOID(struct tree_map_node) p)
 {
-	TOID(struct tree_map_node) s = D_RO(map)->sentinel;
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	TOID(struct tree_map_node) s = rbmap->sentinel;
 
-	if (!NODE_IS_NULL(D_RO(p)->slots[RB_LEFT]))
-		rbtree_map_clear_node(map, D_RO(p)->slots[RB_LEFT]);
+	struct tree_map_node *pp = pgl_tx_open(p.oid);
 
-	if (!NODE_IS_NULL(D_RO(p)->slots[RB_RIGHT]))
-		rbtree_map_clear_node(map, D_RO(p)->slots[RB_RIGHT]);
+	if (!NODE_IS_NULL(pp->slots[RB_LEFT]))
+		rbtree_map_clear_node(map, pp->slots[RB_LEFT]);
 
-	TX_FREE(p);
+	if (!NODE_IS_NULL(pp->slots[RB_RIGHT]))
+		rbtree_map_clear_node(map, pp->slots[RB_RIGHT]);
+
+	pgl_tx_free(p.oid);
 }
-
 
 /*
  * rbtree_map_clear -- removes all elements from the map
@@ -150,20 +168,18 @@ rbtree_map_clear_node(TOID(struct rbtree_map) map, TOID(struct tree_map_node) p)
 int
 rbtree_map_clear(PMEMobjpool *pop, TOID(struct rbtree_map) map)
 {
-	TX_BEGIN(pop) {
-		rbtree_map_clear_node(map, D_RW(map)->root);
-		TX_ADD_FIELD(map, root);
-		TX_ADD_FIELD(map, sentinel);
+	PGL_TX_BEGIN(pop) {
+		struct rbtree_map *rbmap = pgl_tx_open(map.oid);
+		rbtree_map_clear_node(map, rbmap->root);
 
-		TX_FREE(D_RW(map)->sentinel);
+		pgl_tx_free(rbmap->sentinel.oid);
 
-		D_RW(map)->root = TOID_NULL(struct tree_map_node);
-		D_RW(map)->sentinel = TOID_NULL(struct tree_map_node);
-	} TX_END
+		rbmap->root = TOID_NULL(struct tree_map_node);
+		rbmap->sentinel = TOID_NULL(struct tree_map_node);
+	} PGL_TX_END
 
 	return 0;
 }
-
 
 /*
  * rbtree_map_destroy -- cleanups and frees red-black tree instance
@@ -172,14 +188,14 @@ int
 rbtree_map_destroy(PMEMobjpool *pop, TOID(struct rbtree_map) *map)
 {
 	int ret = 0;
-	TX_BEGIN(pop) {
+
+	PGL_TX_BEGIN(pop) {
 		rbtree_map_clear(pop, *map);
-		pmemobj_tx_add_range_direct(map, sizeof(*map));
-		TX_FREE(*map);
+		pgl_tx_free(map->oid);
 		*map = TOID_NULL(struct rbtree_map);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -191,23 +207,29 @@ static void
 rbtree_map_rotate(TOID(struct rbtree_map) map,
 	TOID(struct tree_map_node) node, enum rb_children c)
 {
-	TOID(struct tree_map_node) child = D_RO(node)->slots[!c];
-	TOID(struct tree_map_node) s = D_RO(map)->sentinel;
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	struct tree_map_node *pn = pgl_tx_open(node.oid);
+	struct tree_map_node *pch = pgl_tx_open(pn->slots[!c].oid);
+	TOID(struct tree_map_node) s = rbmap->sentinel;
 
-	TX_ADD(node);
-	TX_ADD(child);
+	pn->slots[!c] = pch->slots[c];
 
-	D_RW(node)->slots[!c] = D_RO(child)->slots[c];
+	if (!TOID_EQUALS(pch->slots[c], s)) {
+		struct tree_map_node *slot =
+			pgl_tx_open(pch->slots[c].oid);
+		slot->parent = node;
+	}
 
-	if (!TOID_EQUALS(D_RO(child)->slots[c], s))
-		TX_SET(D_RW(child)->slots[c], parent, node);
+	pch->parent = pn->parent;
 
-	NODE_P(child) = NODE_P(node);
+	TOID(struct tree_map_node) child =
+		(TOID(struct tree_map_node))pgl_oid(pch);
 
-	TX_SET(NODE_P(node), slots[NODE_LOCATION(node)], child);
+	struct tree_map_node *ppn = pgl_tx_open(pn->parent.oid);
+	ppn->slots[TOID_EQUALS(node, ppn->slots[RB_RIGHT])] = child;
 
-	D_RW(child)->slots[c] = node;
-	D_RW(node)->parent = child;
+	pch->slots[c] = node;
+	pn->parent = child;
 }
 
 /*
@@ -216,21 +238,27 @@ rbtree_map_rotate(TOID(struct rbtree_map) map,
 static void
 rbtree_map_insert_bst(TOID(struct rbtree_map) map, TOID(struct tree_map_node) n)
 {
-	TOID(struct tree_map_node) parent = D_RO(map)->root;
-	TOID(struct tree_map_node) *dst = &RB_FIRST(map);
-	TOID(struct tree_map_node) s = D_RO(map)->sentinel;
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	struct tree_map_node *pnode = pgl_get(rbmap->root.oid);
 
-	D_RW(n)->slots[RB_LEFT] = s;
-	D_RW(n)->slots[RB_RIGHT] = s;
+	TOID(struct tree_map_node) parent = rbmap->root;
+	TOID(struct tree_map_node) *dst = &pnode->slots[RB_LEFT];
+	TOID(struct tree_map_node) s = rbmap->sentinel;
+
+	struct tree_map_node *pn = pgl_tx_open(n.oid);
+	pn->slots[RB_LEFT] = s;
+	pn->slots[RB_RIGHT] = s;
 
 	while (!NODE_IS_NULL(*dst)) {
 		parent = *dst;
-		dst = &D_RW(*dst)->slots[D_RO(n)->key > D_RO(*dst)->key];
+		pnode = pgl_get(dst->oid);
+		dst = &pnode->slots[pn->key > pnode->key];
 	}
 
-	TX_SET(n, parent, parent);
+	pn->parent = parent;
 
-	pmemobj_tx_add_range_direct(dst, sizeof(*dst));
+	/* add pnode to transaction and redirect dst to the objbuf */
+	dst = PTR_TO(pgl_tx_add(pnode), DISP(pnode, dst));
 	*dst = n;
 }
 
@@ -241,22 +269,34 @@ static TOID(struct tree_map_node)
 rbtree_map_recolor(TOID(struct rbtree_map) map,
 	TOID(struct tree_map_node) n, enum rb_children c)
 {
-	TOID(struct tree_map_node) uncle = D_RO(NODE_GRANDP(n))->slots[!c];
+	struct tree_map_node *pn = pgl_get(n.oid);
+	struct tree_map_node *ppn = pgl_tx_open(pn->parent.oid);
+	struct tree_map_node *pgn = pgl_tx_open(ppn->parent.oid);
 
-	if (D_RO(uncle)->color == COLOR_RED) {
-		TX_SET(uncle, color, COLOR_BLACK);
-		TX_SET(NODE_P(n), color, COLOR_BLACK);
-		TX_SET(NODE_GRANDP(n), color, COLOR_RED);
-		return NODE_GRANDP(n);
+	TOID(struct tree_map_node) uncle = pgn->slots[!c];
+
+	struct tree_map_node *puncle = pgl_get(uncle.oid);
+
+	if (puncle->color == COLOR_RED) {
+		puncle = pgl_tx_add(puncle);
+		puncle->color = COLOR_BLACK;
+		ppn->color = COLOR_BLACK;
+		pgn->color = COLOR_RED;
+
+		return ppn->parent;
 	} else {
-		if (NODE_IS(n, !c)) {
-			n = NODE_P(n);
+		if (TOID_EQUALS(n, ppn->slots[!c])) {
+			n = pn->parent;
 			rbtree_map_rotate(map, n, c);
+			/* n was assigned a new value so buffers need reset */
+			pn = pgl_get(n.oid);
+			ppn = pgl_get(pn->parent.oid);
+			pgn = pgl_get(ppn->parent.oid);
 		}
 
-		TX_SET(NODE_P(n), color, COLOR_BLACK);
-		TX_SET(NODE_GRANDP(n), color, COLOR_RED);
-		rbtree_map_rotate(map, NODE_GRANDP(n), (enum rb_children)!c);
+		ppn->color = COLOR_BLACK;
+		pgn->color = COLOR_RED;
+		rbtree_map_rotate(map, ppn->parent, (enum rb_children)!c);
 	}
 
 	return n;
@@ -271,20 +311,37 @@ rbtree_map_insert(PMEMobjpool *pop, TOID(struct rbtree_map) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		TOID(struct tree_map_node) n = TX_ZNEW(struct tree_map_node);
-		D_RW(n)->key = key;
-		D_RW(n)->value = value;
+	PGL_TX_BEGIN(pop) {
+		struct tree_map_node *pn = pgl_tx_alloc_open(
+					sizeof(struct tree_map_node),
+					TOID_TYPE_NUM(struct tree_map_node));
+		TOID(struct tree_map_node) n =
+			(TOID(struct tree_map_node))pgl_oid(pn);
+
+		pn->key = key;
+		pn->value = value;
 
 		rbtree_map_insert_bst(map, n);
 
-		D_RW(n)->color = COLOR_RED;
-		while (D_RO(NODE_P(n))->color == COLOR_RED)
-			n = rbtree_map_recolor(map, n, (enum rb_children)
-					NODE_LOCATION(NODE_P(n)));
+		pn->color = COLOR_RED;
 
-		TX_SET(RB_FIRST(map), color, COLOR_BLACK);
-	} TX_END
+		struct tree_map_node *ppn = pgl_get(pn->parent.oid);
+		struct tree_map_node *pgn = pgl_get(ppn->parent.oid);
+		while (ppn->color == COLOR_RED) {
+			n = rbtree_map_recolor(map, n, (enum rb_children)
+				TOID_EQUALS(pn->parent, pgn->slots[RB_RIGHT]));
+			pn = pgl_get(n.oid);
+			ppn = pgl_get(pn->parent.oid);
+			pgn = pgl_get(ppn->parent.oid);
+		}
+
+		struct rbtree_map *rbmap = pgl_get(map.oid);
+		struct tree_map_node *proot = pgl_get(rbmap->root.oid);
+		struct tree_map_node *first =
+			pgl_tx_open(proot->slots[RB_LEFT].oid);
+
+		first->color = COLOR_BLACK;
+	} PGL_TX_END
 
 	return ret;
 }
@@ -295,19 +352,26 @@ rbtree_map_insert(PMEMobjpool *pop, TOID(struct rbtree_map) map,
 static TOID(struct tree_map_node)
 rbtree_map_successor(TOID(struct rbtree_map) map, TOID(struct tree_map_node) n)
 {
-	TOID(struct tree_map_node) dst = D_RO(n)->slots[RB_RIGHT];
-	TOID(struct tree_map_node) s = D_RO(map)->sentinel;
+	struct tree_map_node *pn = pgl_get(n.oid);
+	struct rbtree_map *rbmap = pgl_get(map.oid);
 
+	TOID(struct tree_map_node) dst = pn->slots[RB_RIGHT];
+	TOID(struct tree_map_node) s = rbmap->sentinel;
+
+	struct tree_map_node *pdst = pgl_get(dst.oid);
 	if (!TOID_EQUALS(s, dst)) {
-		while (!NODE_IS_NULL(D_RO(dst)->slots[RB_LEFT]))
-			dst = D_RO(dst)->slots[RB_LEFT];
-	} else {
-		dst = D_RO(n)->parent;
-		while (TOID_EQUALS(n, D_RO(dst)->slots[RB_RIGHT])) {
-			n = dst;
-			dst = NODE_P(dst);
+		while (!NODE_IS_NULL(pdst->slots[RB_LEFT])) {
+			dst = pdst->slots[RB_LEFT];
+			pdst = pgl_get(dst.oid);
 		}
-		if (TOID_EQUALS(dst, D_RO(map)->root))
+	} else {
+		dst = pn->parent;
+		while (TOID_EQUALS(n, pdst->slots[RB_RIGHT])) {
+			n = dst;
+			dst = pdst->parent;
+			pdst = pgl_get(dst.oid);
+		}
+		if (TOID_EQUALS(dst, rbmap->root))
 			return s;
 	}
 
@@ -320,14 +384,19 @@ rbtree_map_successor(TOID(struct rbtree_map) map, TOID(struct tree_map_node) n)
 static TOID(struct tree_map_node)
 rbtree_map_find_node(TOID(struct rbtree_map) map, uint64_t key)
 {
-	TOID(struct tree_map_node) dst = RB_FIRST(map);
-	TOID(struct tree_map_node) s = D_RO(map)->sentinel;
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	struct tree_map_node *proot = pgl_get(rbmap->root.oid);
 
+	TOID(struct tree_map_node) dst = proot->slots[RB_LEFT];
+	TOID(struct tree_map_node) s = rbmap->sentinel;
+
+	struct tree_map_node *pdst = pgl_get(dst.oid);
 	while (!NODE_IS_NULL(dst)) {
-		if (D_RO(dst)->key == key)
+		if (pdst->key == key)
 			return dst;
 
-		dst = D_RO(dst)->slots[key > D_RO(dst)->key];
+		dst = pdst->slots[key > pdst->key];
+		pdst = pgl_get(dst.oid);
 	}
 
 	return TOID_NULL(struct tree_map_node);
@@ -340,31 +409,52 @@ static TOID(struct tree_map_node)
 rbtree_map_repair_branch(TOID(struct rbtree_map) map,
 	TOID(struct tree_map_node) n, enum rb_children c)
 {
-	TOID(struct tree_map_node) sb = NODE_PARENT_AT(n, !c); /* sibling */
-	if (D_RO(sb)->color == COLOR_RED) {
-		TX_SET(sb, color, COLOR_BLACK);
-		TX_SET(NODE_P(n), color, COLOR_RED);
-		rbtree_map_rotate(map, NODE_P(n), c);
-		sb = NODE_PARENT_AT(n, !c);
+	struct tree_map_node *pn = pgl_tx_open(n.oid);
+	struct tree_map_node *ppn = pgl_tx_open(pn->parent.oid);
+
+	TOID(struct tree_map_node) sb = ppn->slots[!c]; /* sibling */
+	struct tree_map_node *psb = pgl_tx_open(sb.oid);
+
+	if (psb->color == COLOR_RED) {
+		psb->color = COLOR_BLACK;
+		ppn->color = COLOR_RED;
+		rbtree_map_rotate(map, pn->parent, c);
+		sb = ppn->slots[!c];
+		psb = pgl_get(sb.oid);
 	}
 
-	if (D_RO(D_RO(sb)->slots[RB_RIGHT])->color == COLOR_BLACK &&
-		D_RO(D_RO(sb)->slots[RB_LEFT])->color == COLOR_BLACK) {
-		TX_SET(sb, color, COLOR_RED);
-		return D_RO(n)->parent;
-	} else {
-		if (D_RO(D_RO(sb)->slots[!c])->color == COLOR_BLACK) {
-			TX_SET(D_RW(sb)->slots[c], color, COLOR_BLACK);
-			TX_SET(sb, color, COLOR_RED);
-			rbtree_map_rotate(map, sb, (enum rb_children)!c);
-			sb = NODE_PARENT_AT(n, !c);
-		}
-		TX_SET(sb, color, D_RO(NODE_P(n))->color);
-		TX_SET(NODE_P(n), color, COLOR_BLACK);
-		TX_SET(D_RW(sb)->slots[!c], color, COLOR_BLACK);
-		rbtree_map_rotate(map, NODE_P(n), c);
+	struct tree_map_node *psb_slots[MAX_RB];
+	psb_slots[RB_LEFT] = pgl_tx_open(psb->slots[RB_LEFT].oid);
+	psb_slots[RB_RIGHT] = pgl_tx_open(psb->slots[RB_RIGHT].oid);
 
-		return RB_FIRST(map);
+	if (psb_slots[RB_RIGHT]->color == COLOR_BLACK &&
+		psb_slots[RB_LEFT]->color == COLOR_BLACK) {
+		psb->color = COLOR_RED;
+		return pn->parent;
+	} else {
+		if (psb_slots[!c]->color == COLOR_BLACK) {
+			psb_slots[c]->color = COLOR_BLACK;
+			psb->color = COLOR_RED;
+			rbtree_map_rotate(map, sb, (enum rb_children)!c);
+			sb = ppn->slots[!c];
+			/* sb is assigned a new value, reset relevant buffers */
+			psb = pgl_get(sb.oid);
+			psb_slots[RB_LEFT] =
+				pgl_get(psb->slots[RB_LEFT].oid);
+			psb_slots[RB_RIGHT] =
+				pgl_get(psb->slots[RB_RIGHT].oid);
+		}
+		psb->color = ppn->color;
+		ppn->color = COLOR_BLACK;
+		psb_slots[!c]->color = COLOR_BLACK;
+		rbtree_map_rotate(map, pn->parent, c);
+
+		struct rbtree_map *rbmap = pgl_get(map.oid);
+		struct tree_map_node *proot = pgl_get(rbmap->root.oid);
+
+		TOID(struct tree_map_node) rb1st = proot->slots[RB_LEFT];
+
+		return rb1st;
 	}
 
 	return n;
@@ -377,12 +467,23 @@ rbtree_map_repair_branch(TOID(struct rbtree_map) map,
 static void
 rbtree_map_repair(TOID(struct rbtree_map) map, TOID(struct tree_map_node) n)
 {
-	/* if left, repair right sibling, otherwise repair left sibling. */
-	while (!TOID_EQUALS(n, RB_FIRST(map)) && D_RO(n)->color == COLOR_BLACK)
-		n = rbtree_map_repair_branch(map, n, (enum rb_children)
-				NODE_LOCATION(n));
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	struct tree_map_node *proot = pgl_get(rbmap->root.oid);
 
-	TX_SET(n, color, COLOR_BLACK);
+	struct tree_map_node *pn = pgl_get(n.oid);
+	struct tree_map_node *ppn = pgl_get(pn->parent.oid);
+	while (!TOID_EQUALS(n, proot->slots[RB_LEFT]) &&
+			pn->color == COLOR_BLACK) {
+		n = rbtree_map_repair_branch(map, n, (enum rb_children)
+				TOID_EQUALS(n, ppn->slots[RB_RIGHT]));
+		pn = pgl_get(n.oid);
+		ppn = pgl_get(pn->parent.oid);
+		/* rbtree_map_repair_branch() could modify root */
+		proot = pgl_get(rbmap->root.oid);
+	}
+
+	pn = pgl_tx_add(pn);
+	pn->color = COLOR_BLACK;
 }
 
 /*
@@ -397,42 +498,60 @@ rbtree_map_remove(PMEMobjpool *pop, TOID(struct rbtree_map) map, uint64_t key)
 	if (TOID_IS_NULL(n))
 		return ret;
 
-	ret = D_RO(n)->value;
+	struct tree_map_node *pn = pgl_get(n.oid);
+	struct rbtree_map *rbmap = pgl_get(map.oid);
 
-	TOID(struct tree_map_node) s = D_RO(map)->sentinel;
-	TOID(struct tree_map_node) r = D_RO(map)->root;
+	ret = pn->value;
 
-	TOID(struct tree_map_node) y = (NODE_IS_NULL(D_RO(n)->slots[RB_LEFT]) ||
-					NODE_IS_NULL(D_RO(n)->slots[RB_RIGHT]))
+	TOID(struct tree_map_node) s = rbmap->sentinel;
+	TOID(struct tree_map_node) r = rbmap->root;
+
+	TOID(struct tree_map_node) y = (NODE_IS_NULL(pn->slots[RB_LEFT]) ||
+					NODE_IS_NULL(pn->slots[RB_RIGHT]))
 					? n : rbtree_map_successor(map, n);
 
-	TOID(struct tree_map_node) x = NODE_IS_NULL(D_RO(y)->slots[RB_LEFT]) ?
-			D_RO(y)->slots[RB_RIGHT] : D_RO(y)->slots[RB_LEFT];
+	struct tree_map_node *py = pgl_get(y.oid);
+	TOID(struct tree_map_node) x = NODE_IS_NULL(py->slots[RB_LEFT]) ?
+			py->slots[RB_RIGHT] : py->slots[RB_LEFT];
 
-	TX_BEGIN(pop) {
-		TX_SET(x, parent, NODE_P(y));
-		if (TOID_EQUALS(NODE_P(x), r)) {
-			TX_SET(r, slots[RB_LEFT], x);
+	PGL_TX_BEGIN(pop) {
+		struct tree_map_node *px = pgl_tx_open(x.oid);
+		px->parent = py->parent;
+		if (TOID_EQUALS(px->parent, r)) {
+			struct tree_map_node *pr = pgl_tx_open(r.oid);
+			pr->slots[RB_LEFT] = x;
 		} else {
-			TX_SET(NODE_P(y), slots[NODE_LOCATION(y)], x);
+			struct tree_map_node *ppy =
+				pgl_tx_open(py->parent.oid);
+			ppy->slots[TOID_EQUALS(y, ppy->slots[RB_RIGHT])] = x;
 		}
 
-		if (D_RO(y)->color == COLOR_BLACK)
+		if (py->color == COLOR_BLACK)
 			rbtree_map_repair(map, x);
 
 		if (!TOID_EQUALS(y, n)) {
-			TX_ADD(y);
-			D_RW(y)->slots[RB_LEFT] = D_RO(n)->slots[RB_LEFT];
-			D_RW(y)->slots[RB_RIGHT] = D_RO(n)->slots[RB_RIGHT];
-			D_RW(y)->parent = D_RO(n)->parent;
-			D_RW(y)->color = D_RO(n)->color;
-			TX_SET(D_RW(n)->slots[RB_LEFT], parent, y);
-			TX_SET(D_RW(n)->slots[RB_RIGHT], parent, y);
+			py = pgl_tx_add(py);
+			/* rbtree_map_repair() might modify n's data */
+			pn = pgl_get(n.oid);
+			py->slots[RB_LEFT] = pn->slots[RB_LEFT];
+			py->slots[RB_RIGHT] = pn->slots[RB_RIGHT];
+			py->parent = pn->parent;
+			py->color = pn->color;
 
-			TX_SET(NODE_P(n), slots[NODE_LOCATION(n)], y);
+			struct tree_map_node *pnl =
+				pgl_tx_open(pn->slots[RB_LEFT].oid);
+			struct tree_map_node *pnr =
+				pgl_tx_open(pn->slots[RB_RIGHT].oid);
+			pnl->parent = y;
+			pnr->parent = y;
+
+			struct tree_map_node *ppn =
+				pgl_tx_open(pn->parent.oid);
+			ppn->slots[TOID_EQUALS(n, ppn->slots[RB_RIGHT])] = y;
 		}
-		TX_FREE(n);
-	} TX_END
+
+		pgl_tx_free(n.oid);
+	} PGL_TX_END
 
 	return ret;
 }
@@ -447,7 +566,10 @@ rbtree_map_get(PMEMobjpool *pop, TOID(struct rbtree_map) map, uint64_t key)
 	if (TOID_IS_NULL(node))
 		return OID_NULL;
 
-	return D_RO(node)->value;
+	struct tree_map_node *pn = pgl_get(node.oid);
+	PMEMoid retoid = pn->value;
+
+	return retoid;
 }
 
 /*
@@ -473,14 +595,17 @@ rbtree_map_foreach_node(TOID(struct rbtree_map) map,
 {
 	int ret = 0;
 
-	if (TOID_EQUALS(p, D_RO(map)->sentinel))
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	if (TOID_EQUALS(p, rbmap->sentinel))
 		return 0;
 
+	struct tree_map_node *pp = pgl_get(p.oid);
+	/* this is an in-order traversal and should return sorted keys */
 	if ((ret = rbtree_map_foreach_node(map,
-		D_RO(p)->slots[RB_LEFT], cb, arg)) == 0) {
-		if ((ret = cb(D_RO(p)->key, D_RO(p)->value, arg)) == 0)
+		pp->slots[RB_LEFT], cb, arg)) == 0) {
+		if ((ret = cb(pp->key, pp->value, arg)) == 0)
 			rbtree_map_foreach_node(map,
-				D_RO(p)->slots[RB_RIGHT], cb, arg);
+				pp->slots[RB_RIGHT], cb, arg);
 	}
 
 	return ret;
@@ -493,7 +618,12 @@ int
 rbtree_map_foreach(PMEMobjpool *pop, TOID(struct rbtree_map) map,
 	int (*cb)(uint64_t key, PMEMoid value, void *arg), void *arg)
 {
-	return rbtree_map_foreach_node(map, RB_FIRST(map), cb, arg);
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	struct tree_map_node *proot = pgl_get(rbmap->root.oid);
+
+	TOID(struct tree_map_node) rb1st = proot->slots[RB_LEFT];
+
+	return rbtree_map_foreach_node(map, rb1st, cb, arg);
 }
 
 /*
@@ -502,7 +632,12 @@ rbtree_map_foreach(PMEMobjpool *pop, TOID(struct rbtree_map) map,
 int
 rbtree_map_is_empty(PMEMobjpool *pop, TOID(struct rbtree_map) map)
 {
-	return TOID_IS_NULL(RB_FIRST(map));
+	struct rbtree_map *rbmap = pgl_get(map.oid);
+	struct tree_map_node *proot = pgl_get(rbmap->root.oid);
+
+	TOID(struct tree_map_node) rb1st = proot->slots[RB_LEFT];
+
+	return TOID_IS_NULL(rb1st);
 }
 
 /*
@@ -525,13 +660,14 @@ rbtree_map_insert_new(PMEMobjpool *pop, TOID(struct rbtree_map) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		PMEMoid n = pmemobj_tx_alloc(size, type_num);
-		constructor(pop, pmemobj_direct(n), arg);
+	PGL_TX_BEGIN(pop) {
+		void *pn = pgl_tx_alloc_open(size, type_num);
+		PMEMoid n = pgl_oid(pn);
+		constructor(pop, pn, arg);
 		rbtree_map_insert(pop, map, key, n);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -547,7 +683,7 @@ rbtree_map_remove_free(PMEMobjpool *pop, TOID(struct rbtree_map) map,
 
 	TX_BEGIN(pop) {
 		PMEMoid val = rbtree_map_remove(pop, map, key);
-		pmemobj_tx_free(val);
+		pgl_tx_free(val);
 	} TX_ONABORT {
 		ret = 1;
 	} TX_END

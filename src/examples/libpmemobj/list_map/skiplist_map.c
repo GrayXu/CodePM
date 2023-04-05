@@ -38,9 +38,12 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
+
 #include "skiplist_map.h"
 
-#define SKIPLIST_LEVELS_NUM 4
+#include <libpangolin.h>
+
+#define SKIPLIST_LEVELS_NUM 24
 #define NULL_NODE TOID_NULL(struct skiplist_map_node)
 
 struct skiplist_map_entry {
@@ -62,12 +65,14 @@ skiplist_map_create(PMEMobjpool *pop, TOID(struct skiplist_map_node) *map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		pmemobj_tx_add_range_direct(map, sizeof(*map));
-		*map = TX_ZNEW(struct skiplist_map_node);
-	} TX_ONABORT {
+	PGL_TX_BEGIN(pop) {
+		*map = (TOID(struct skiplist_map_node))pgl_tx_alloc(
+				sizeof(struct skiplist_map_node),
+				TOID_TYPE_NUM(struct skiplist_map_node));
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
+
 	return ret;
 }
 
@@ -77,10 +82,13 @@ skiplist_map_create(PMEMobjpool *pop, TOID(struct skiplist_map_node) *map,
 int
 skiplist_map_clear(PMEMobjpool *pop, TOID(struct skiplist_map_node) map)
 {
-	while (!TOID_EQUALS(D_RO(map)->next[0], NULL_NODE)) {
-		TOID(struct skiplist_map_node) next = D_RO(map)->next[0];
-		skiplist_map_remove_free(pop, map, D_RO(next)->entry.key);
+	struct skiplist_map_node *smap = pgl_get(map.oid), *pnext = NULL;
+
+	while (!TOID_EQUALS(smap->next[0], NULL_NODE)) {
+		pnext = pgl_get(smap->next[0].oid);
+		skiplist_map_remove_free(pop, map, pnext->entry.key);
 	}
+
 	return 0;
 }
 
@@ -92,14 +100,14 @@ skiplist_map_destroy(PMEMobjpool *pop, TOID(struct skiplist_map_node) *map)
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
 		skiplist_map_clear(pop, *map);
-		pmemobj_tx_add_range_direct(map, sizeof(*map));
-		TX_FREE(*map);
+		pgl_tx_free(map->oid);
 		*map = TOID_NULL(struct skiplist_map_node);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
+
 	return ret;
 }
 
@@ -115,13 +123,14 @@ skiplist_map_insert_new(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
-		PMEMoid n = pmemobj_tx_alloc(size, type_num);
-		constructor(pop, pmemobj_direct(n), arg);
+	PGL_TX_BEGIN(pop) {
+		void *pn = pgl_tx_alloc_open(size, type_num);
+		PMEMoid n = pgl_oid(pn);
+		constructor(pop, pn, arg);
 		skiplist_map_insert(pop, map, key, n);
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -129,16 +138,36 @@ skiplist_map_insert_new(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 /*
  * skiplist_map_insert_node -- (internal) adds new node in selected place
  */
+
 static void
-skiplist_map_insert_node(TOID(struct skiplist_map_node) new_node,
+skiplist_map_insert_node(struct skiplist_map_node *pnode,
 	TOID(struct skiplist_map_node) path[SKIPLIST_LEVELS_NUM])
 {
 	unsigned current_level = 0;
 	do {
-		TX_ADD_FIELD(path[current_level], next[current_level]);
-		D_RW(new_node)->next[current_level] =
-			D_RO(path[current_level])->next[current_level];
-		D_RW(path[current_level])->next[current_level] = new_node;
+		struct skiplist_map_node *pcurr =
+			pgl_tx_open(path[current_level].oid);
+		/*
+		 * OBUF-OPT: Using pgl_tx_add_range() doesn't actually make
+		 * much difference. Could the reason be creating small redo log
+		 * entries?
+		 *
+		 * Comment out pgl_tx_add_range() to see the difference.
+		 */
+		pnode = pgl_tx_add_range(pnode,
+			offsetof(struct skiplist_map_node,
+				next[current_level]),
+			sizeof(PMEMoid));
+
+		pnode->next[current_level] = pcurr->next[current_level];
+
+		pcurr = pgl_tx_add_range(pcurr,
+			offsetof(struct skiplist_map_node,
+				next[current_level]),
+			sizeof(PMEMoid));
+
+		pcurr->next[current_level] =
+			(TOID(struct skiplist_map_node))pgl_oid(pnode);
 	} while (++current_level < SKIPLIST_LEVELS_NUM && rand() % 2 == 0);
 }
 
@@ -151,15 +180,20 @@ skiplist_map_find(uint64_t key, TOID(struct skiplist_map_node) map,
 	TOID(struct skiplist_map_node) *path)
 {
 	int current_level;
-	TOID(struct skiplist_map_node) active = map;
+
+	TOID(struct skiplist_map_node) active = map, next;
+	struct skiplist_map_node *pactv = pgl_get(map.oid), *pnext = NULL;
+
 	for (current_level = SKIPLIST_LEVELS_NUM - 1;
 			current_level >= 0; current_level--) {
-		for (TOID(struct skiplist_map_node) next =
-				D_RO(active)->next[current_level];
-				!TOID_EQUALS(next, NULL_NODE) &&
-				D_RO(next)->entry.key < key;
-				next = D_RO(active)->next[current_level]) {
-			active = next;
+		next = pactv->next[current_level];
+		pnext = pgl_get(next.oid);
+		for (; !TOID_EQUALS(next, NULL_NODE) &&
+				pnext->entry.key < key;
+				pnext = pgl_get(next.oid)) {
+			active = pactv->next[current_level];
+			pactv = pgl_get(active.oid);
+			next = pactv->next[current_level];
 		}
 
 		path[current_level] = active;
@@ -174,19 +208,26 @@ skiplist_map_insert(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 	uint64_t key, PMEMoid value)
 {
 	int ret = 0;
-	TOID(struct skiplist_map_node) new_node;
 	TOID(struct skiplist_map_node) path[SKIPLIST_LEVELS_NUM];
 
-	TX_BEGIN(pop) {
-		new_node = TX_ZNEW(struct skiplist_map_node);
-		D_RW(new_node)->entry.key = key;
-		D_RW(new_node)->entry.value = value;
+	PGL_TX_BEGIN(pop) {
+		struct skiplist_map_node *pnode =
+			pgl_tx_alloc_open(sizeof(struct skiplist_map_node),
+				TOID_TYPE_NUM(struct skiplist_map_node));
+
+		pnode = pgl_tx_add_range(pnode,
+			offsetof(struct skiplist_map_node, entry),
+			sizeof(struct skiplist_map_entry));
+
+		pnode->entry.key = key;
+		pnode->entry.value = value;
 
 		skiplist_map_find(key, map, path);
-		skiplist_map_insert_node(new_node, path);
-	} TX_ONABORT {
+		skiplist_map_insert_node(pnode, path);
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
+
 	return ret;
 }
 
@@ -199,12 +240,12 @@ skiplist_map_remove_free(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 {
 	int ret = 0;
 
-	TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {
 		PMEMoid val = skiplist_map_remove(pop, map, key);
-		pmemobj_tx_free(val);
-	} TX_ONABORT {
+		pgl_tx_free(val);
+	} PGL_TX_ONABORT {
 		ret = 1;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -216,12 +257,21 @@ static void
 skiplist_map_remove_node(
 	TOID(struct skiplist_map_node) path[SKIPLIST_LEVELS_NUM])
 {
-	TOID(struct skiplist_map_node) to_remove = D_RO(path[0])->next[0];
-	int i;
-	for (i = 0; i < SKIPLIST_LEVELS_NUM; i++) {
-		if (TOID_EQUALS(D_RO(path[i])->next[i], to_remove)) {
-			TX_ADD_FIELD(path[i], next[i]);
-			D_RW(path[i])->next[i] = D_RO(to_remove)->next[i];
+	struct skiplist_map_node *ppath = pgl_get(path[0].oid);
+	TOID(struct skiplist_map_node) to_remove = ppath->next[0];
+	struct skiplist_map_node *premove = pgl_get(to_remove.oid);
+
+	for (int i = 0; i < SKIPLIST_LEVELS_NUM; i++) {
+		ppath = pgl_get(path[i].oid);
+		if (TOID_EQUALS(ppath->next[i], to_remove)) {
+
+		/*	ppath = pgl_tx_add(ppath); */
+			ppath = pgl_tx_add_range(ppath,
+				offsetof(struct skiplist_map_node,
+					next[i]),
+				sizeof(PMEMoid));
+
+			ppath->next[i] = premove->next[i];
 		}
 	}
 }
@@ -235,18 +285,21 @@ skiplist_map_remove(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 {
 	PMEMoid ret = OID_NULL;
 	TOID(struct skiplist_map_node) path[SKIPLIST_LEVELS_NUM];
-	TOID(struct skiplist_map_node) to_remove;
-	TX_BEGIN(pop) {
-		skiplist_map_find(key, map, path);
-		to_remove = D_RO(path[0])->next[0];
+
+	skiplist_map_find(key, map, path); /* no need to be in tx */
+	struct skiplist_map_node *ppath = pgl_get(path[0].oid);
+	TOID(struct skiplist_map_node) to_remove = ppath->next[0];
+	struct skiplist_map_node *premove = pgl_get(to_remove.oid);
+
+	PGL_TX_BEGIN(pop) {
 		if (!TOID_EQUALS(to_remove, NULL_NODE) &&
-			D_RO(to_remove)->entry.key == key) {
-			ret = D_RO(to_remove)->entry.value;
+			premove->entry.key == key) {
+			ret = premove->entry.value;
 			skiplist_map_remove_node(path);
 		}
-	} TX_ONABORT {
+	} PGL_TX_ONABORT {
 		ret = OID_NULL;
-	} TX_END
+	} PGL_TX_END
 
 	return ret;
 }
@@ -261,11 +314,15 @@ skiplist_map_get(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 	PMEMoid ret = OID_NULL;
 	TOID(struct skiplist_map_node) path[SKIPLIST_LEVELS_NUM], found;
 	skiplist_map_find(key, map, path);
-	found = D_RO(path[0])->next[0];
-	if (!TOID_EQUALS(found, NULL_NODE) &&
-		D_RO(found)->entry.key == key) {
-		ret = D_RO(found)->entry.value;
+
+	struct skiplist_map_node *ppath = pgl_get(path[0].oid);
+	found = ppath->next[0];
+	struct skiplist_map_node *pfound = pgl_get(found.oid);
+
+	if (!TOID_EQUALS(found, NULL_NODE) && pfound->entry.key == key) {
+		ret = pfound->entry.value;
 	}
+
 	return ret;
 }
 
@@ -280,11 +337,14 @@ skiplist_map_lookup(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 	TOID(struct skiplist_map_node) path[SKIPLIST_LEVELS_NUM], found;
 
 	skiplist_map_find(key, map, path);
-	found = D_RO(path[0])->next[0];
-	if (!TOID_EQUALS(found, NULL_NODE) &&
-		D_RO(found)->entry.key == key) {
+
+	struct skiplist_map_node *ppath = pgl_get(path[0].oid);
+	found = ppath->next[0];
+	struct skiplist_map_node *pfound = pgl_get(found.oid);
+
+	if (!TOID_EQUALS(found, NULL_NODE) && pfound->entry.key == key)
 		ret = 1;
-	}
+
 	return ret;
 }
 
@@ -295,11 +355,13 @@ int
 skiplist_map_foreach(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 	int (*cb)(uint64_t key, PMEMoid value, void *arg), void *arg)
 {
-	TOID(struct skiplist_map_node) next = map;
-	while (!TOID_EQUALS(D_RO(next)->next[0], NULL_NODE)) {
-		next = D_RO(next)->next[0];
-		cb(D_RO(next)->entry.key, D_RO(next)->entry.value, arg);
+	struct skiplist_map_node *pnext = pgl_get(map.oid);
+
+	while (!TOID_EQUALS(pnext->next[0], NULL_NODE)) {
+		pnext = pgl_get(pnext->next[0].oid);
+		cb(pnext->entry.key, pnext->entry.value, arg);
 	}
+
 	return 0;
 }
 
@@ -309,7 +371,10 @@ skiplist_map_foreach(PMEMobjpool *pop, TOID(struct skiplist_map_node) map,
 int
 skiplist_map_is_empty(PMEMobjpool *pop, TOID(struct skiplist_map_node) map)
 {
-	return TOID_IS_NULL(D_RO(map)->next[0]);
+	struct skiplist_map_node *smap = pgl_get(map.oid);
+	int empty = TOID_IS_NULL(smap->next[0]);
+
+	return empty;
 }
 
 /*
