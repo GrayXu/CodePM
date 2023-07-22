@@ -1,0 +1,7 @@
+[submodule "third_party/isa-l-pm"]
+	path = third_party/isa-l-pm
+	url = git@github.com:GrayXu/isa-l-pm.git
+[submodule "third_party/isa-l-code"]
+	path = third_party/isa-l-code
+	url = git@github.com:GrayXu/isa-l-codepm.git
+	branch = main

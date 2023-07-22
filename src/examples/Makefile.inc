@@ -38,14 +38,15 @@ TOP := $(TOP_SRC)/..
 HEADERS = $(wildcard *.h) $(wildcard *.hpp)
 
 INCDIR = $(TOP_SRC)/include
-LIBDIR = $(TOP_SRC)/debug
+LIBDIR = $(TOP_SRC)/nondebug
 
 include $(TOP)/src/common.inc
 
 CXXFLAGS = -std=c++11 -ggdb -Wall -Werror
 CXXFLAGS += $(GLIBC_CXXFLAGS)
 CXXFLAGS +=  $(EXTRA_CXXFLAGS)
-CFLAGS = -std=gnu99 -ggdb -Wall -Werror -Wmissing-prototypes $(EXTRA_CFLAGS)
+# CFLAGS = -std=gnu99 -ggdb -Wall -Werror -Wmissing-prototypes $(EXTRA_CFLAGS)
+CFLAGS = -std=gnu99 -ggdb -Wall -Wmissing-prototypes $(EXTRA_CFLAGS)
 LDFLAGS = -Wl,-rpath=$(LIBDIR) -L$(LIBDIR) $(EXTRA_LDFLAGS)
 ifneq ($(SANITIZE),)
 CFLAGS += -fsanitize=$(SANITIZE)

@@ -94,6 +94,7 @@ static const struct pool_attr Obj_open_attr = {
 		{0}, {0}, {0}, {0}, {0}
 };
 
+// libpmemobj has an internal cuckoo hashing table to track all pool metadata
 static struct cuckoo *pools_ht; /* hash table used for searching by UUID */
 static struct ravl *pools_tree; /* tree used for searching by address */
 
@@ -2437,7 +2438,7 @@ constructor_realloc(void *ctx, void *ptr, size_t usable_size, void *arg)
 	OHDR(ptr)->csum = pangolin_adler32(CSUM0, ptr, USIZE(ptr));
 
 #ifdef PANGOLIN_PARITY
-	int err = pangolin_update_parity(pop, REAL(ptr), &ohdr, OHDR_SIZE);
+	int err = pangolin_update_parity_x(pop, REAL(ptr), &ohdr, OHDR_SIZE, 0);
 	if (err != 0) {
 		LOG_ERR("pangolin parity update for the root object failed");
 		return EINVAL;

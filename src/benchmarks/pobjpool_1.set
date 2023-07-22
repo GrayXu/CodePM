@@ -1,0 +1,5 @@
+PMEMPOOLSET
+110G /mnt/pmem2.1/pobjpool
+
+# REPLICA
+# 100G /mnt/pmem/pobjpool.replica

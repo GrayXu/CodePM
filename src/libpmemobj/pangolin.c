@@ -41,6 +41,22 @@
 #include "libpangolin.h"
 #include "objbuf_tx.h"
 
+#include "x86intrin.h"
+#include <immintrin.h>
+
+#include <pthread.h>
+
+#include "pangolin_ec.h"
+
+// for easy code reading
+#ifndef PANGOLIN_PARITY
+#define PANGOLIN_PARITY
+#endif
+
+#define CLFLUSHOPT_ASM(addr)\
+	asm volatile("clflushopt %0" :\
+	"+m" (*(volatile char *)(addr)));
+
 /*
  * pangolin_repair_page -- repair a page's data
  */
@@ -136,13 +152,44 @@ pangolin_adjust_zone_size(uint32_t zone_id)
 
 #ifdef PANGOLIN_PARITY
 extern int
-xor_gen_sse(int vects, size_t len, void **array);
+xor_gen_sse_pgl(int vects, size_t len, void **array);
 
 extern int
-xor_gen_avx(int vects, size_t len, void **array);
+xor_gen_sse_pipeline_pgl(int vects, size_t len, void **array);
 
 extern int
-xor_gen_avx512(int vects, size_t len, void **array);
+xor_gen_avx512_pgl(int vects, size_t len, void **array);
+
+extern int
+xor_gen_avx_pgl(int vects, size_t len, void **array);
+
+extern int
+xor_gen_avx512_pipeline_pgl(int vects, size_t len, void **array);
+
+// you can disable locks for parity updates
+static inline int
+os_rwlock_rdlock_wrap(os_rwlock_t *__restrict rwlock) {
+#ifndef PANGOLIN_PARITY_NOLOCK
+	return os_rwlock_rdlock(rwlock);
+#endif
+	return 0;
+}
+
+static inline int
+os_rwlock_wrlock_wrap(os_rwlock_t *__restrict rwlock) {
+#ifndef PANGOLIN_PARITY_NOLOCK
+	return os_rwlock_wrlock(rwlock);
+#endif
+	return 0;
+}
+
+static inline int
+os_rwlock_unlock_wrap(os_rwlock_t *__restrict rwlock) {
+#ifndef PANGOLIN_PARITY_NOLOCK
+	return os_rwlock_unlock(rwlock);
+#endif
+	return 0;
+}
 
 /*
  * pangolin_update_column_parity -- update parity of a range column
@@ -168,38 +215,205 @@ pangolin_update_column_parity(PMEMobjpool *pop, uint64_t *data, uint64_t *newd,
 	while (__atomic_exchange_n(&ort->zone_rclock[zid][rclock], 1,
 			__ATOMIC_ACQUIRE | __ATOMIC_HLE_ACQUIRE));
 #else
-	if (size >= ort->rclock_threshold)
-		os_rwlock_wrlock(&ort->zone_rclock[zid][rclock]);
-	else
-		os_rwlock_rdlock(&ort->zone_rclock[zid][rclock]);
 
-	if (size >= ort->rclock_threshold) {
+	if (size >= ort->rclock_threshold)  
+		os_rwlock_wrlock_wrap(&ort->zone_rclock[zid][rclock]);  // SIMD: read + write lock
+	else
+		os_rwlock_rdlock_wrap(&ort->zone_rclock[zid][rclock]);  // Otherwise: read lock
+
+	if (size >= ort->rclock_threshold) {  // SIMD coding threshold
 #endif
-		/*
-		 * xor_gen_sse() requires 16-byte alignment
-		 * xor_gen_avx() and xor_gen_avx512() require 32-byte alignment
+		/* 
+		 * SIMD
+		 * xor_gen_sse_pgl() requires 16-byte alignment
+		 * xor_gen_avx() and xor_gen_avx512_pgl() require 32-byte alignment
 		 */
-		ASSERT(ALIGNED_32(data));
-		ASSERT(ALIGNED_32(parity));
-		if (newd == NULL) {
-			void *array[3] = {data, parity, parity};
-			xor_gen_sse(3, size, array);
-		} else {
-			ASSERT(ALIGNED_16(newd));
-			void *array[4] = {data, newd, parity, parity};
-			xor_gen_sse(4, size, array);
+		int (*xor_parity)(int vects, size_t len, void **array);
+
+// xor_parity function
+#ifdef PANGOLIN_AVX512CODE
+	#ifdef PANGOLIN_PIPELINE
+		xor_parity = &xor_gen_avx512_pipeline_pgl;
+	#else
+		xor_parity = &xor_gen_avx512_pgl;
+	#endif
+#else
+	#ifdef PANGOLIN_PIPELINE
+		xor_parity = &xor_gen_sse_pipeline_pgl;
+	#else
+		xor_parity = &xor_gen_sse_pgl;
+	#endif
+#endif
+		if (newd == NULL) {  // no newd means xor 0, no need to compute. so it can also be considered as RAID-like append
+			void *array[3] = {data, parity, parity};  // parity:=data+parity
+			xor_parity(3, size, array); 
+		} else {  // this is the update flow of new data, no mem footprint except data,newd,parity
+			void *array[4] = {data, newd, parity, parity};  // parity:=data+newd+parity
+			xor_parity(4, size, array);
 		}
 #ifndef PANGOLIN_RCLOCKHLE
 	} else {
+		/*
+		 * atomic xor 
+		*/
 		size_t words = size >> 3;
-		if (newd == NULL) {
-			for (size_t i = 0; i < words; i++)
-				__atomic_xor_fetch(&parity[i], data[i],
-					__ATOMIC_RELAXED);
-		} else {
-			for (size_t i = 0; i < words; i++)
-				__atomic_xor_fetch(&parity[i],
-					data[i] ^ newd[i], __ATOMIC_RELAXED);
+		size_t flush_batches = words >> 3;
+		size_t i = 0;
+		if (newd == NULL) {  // append update
+			for (i = 0; i < words; i++) {
+				__atomic_xor_fetch(&parity[i], data[i], __ATOMIC_RELAXED);
+	#ifdef PANGOLIN_PIPELINE
+				if (((i+1) & 7) == 0) pmemops_xflush(&pop->p_ops, &parity[i-7], 64, PMEMOBJ_F_RELAXED);  // flush cache line
+	#endif
+			}
+		} else {  // normal update
+			for (i = 0; i < words; i++) {
+				__atomic_xor_fetch(&parity[i], data[i] ^ newd[i], __ATOMIC_RELAXED);
+	#ifdef PANGOLIN_PIPELINE
+				if (((i+1) & 7) == 0) pmemops_xflush(&pop->p_ops, &parity[i-7], 64, PMEMOBJ_F_RELAXED);  // flush cache line
+	#endif
+			}
+		}
+	#ifdef PANGOLIN_PIPELINE
+		// not 64B aligned -> an extra flush
+		if (unlikely((i & 7) != 0)) pmemops_xflush(&pop->p_ops, &parity[i-i%8], 64, PMEMOBJ_F_RELAXED);
+	#endif
+	}
+#endif
+
+#ifdef PANGOLIN_RCLOCKHLE
+	__atomic_clear(&ort->zone_rclock[zid][rclock],
+		__ATOMIC_RELEASE | __ATOMIC_HLE_RELEASE);
+#else
+	os_rwlock_unlock_wrap(&ort->zone_rclock[zid][rclock]);
+#endif
+
+	return 0;
+}
+
+/**
+ * multi-parity version, use isa-l-pm
+*/ 
+static int
+pangolin_update_column_parity_multi(PMEMobjpool *pop, uint64_t *data, uint64_t *newd,
+	uint64_t *parity, size_t size, uint32_t zid, uint32_t rclock, uint32_t vec_i)
+{
+	ASSERT(ALIGNED_8(size));
+	ASSERT(ALIGNED_8(parity));
+	struct obuf_runtime *ort = obuf_get_runtime();
+	struct ec_runtime *ec = ec_get_runtime();
+
+	uint64_t *parities[2];
+	if (ort->last_zone_id == zid) {
+		parities[0] = parity;
+		if (ec->p != 1) parities[1] = (char *)parity + ort->last_zone_row_size;
+		else parities[1] = NULL;
+	} else {
+		parities[0] = parity;
+		if (ec->p != 1) parities[1] = (char *)parity + ort->zone_row_size;
+		else parities[1] = NULL;
+	}
+
+#ifdef PANGOLIN_RCLOCKHLE
+	while (__atomic_exchange_n(&ort->zone_rclock[zid][rclock], 1, __ATOMIC_ACQUIRE | __ATOMIC_HLE_ACQUIRE));
+#else
+	if (size >= ort->rclock_threshold) os_rwlock_wrlock_wrap(&ort->zone_rclock[zid][rclock]);
+	else os_rwlock_rdlock_wrap(&ort->zone_rclock[zid][rclock]);
+
+	if (size >= ort->rclock_threshold) {  // SIMD coding
+#endif
+		if (newd == NULL) { // append style (data == delta_data)
+#ifdef PANGOLIN_PIPELINE
+			encode_update_pipeline(ec, data, parities, size, vec_i, PANGOLIN_EC_TEMPORAL);
+#else
+			encode_update(ec, data, parities, size, vec_i, PANGOLIN_EC_TEMPORAL);
+#endif
+		} else {  // normal update with new data (w/ mid buffer)
+#ifdef PANGOLIN_PIPELINE
+			// update_parity_inplace_pipeline(ec, data, (char **)parities, size, vec_i, newd, PANGOLIN_EC_TEMPORAL);
+			update_parity_pipeline(ec, data, (char **)parities, size, vec_i, newd, PANGOLIN_EC_TEMPORAL);
+#else
+			// update_parity_inplace(ec, data, (char **)parities, size, vec_i, newd, PANGOLIN_EC_TEMPORAL);
+			update_parity(ec, data, (char **)parities, size, vec_i, newd, PANGOLIN_EC_TEMPORAL);
+#endif
+		}
+#ifndef PANGOLIN_RCLOCKHLE
+	} else { // atomic coding (multiple parity update with atomic uses an extra delta parity buf, compute it first, then atomic xor back. baseline performance is generally low, cache efficiency will be low)
+		size_t words = size >> 3;  // 8B -> 1 write
+		size_t flush_batches = words >> 3;  // 64B as a flush batch
+		size_t i = 0;
+		if (ec->p == 1) {  // normal and simple xor parity
+			if (newd == NULL) {  // append update
+				for (i = 0; i < words; i++) {
+					__atomic_xor_fetch(&parity[i], data[i], __ATOMIC_RELAXED);
+#ifdef PANGOLIN_PIPELINE
+					if (((i+1) & 7) == 0) pmemops_xflush(&pop->p_ops, &parity[i-7], 64, PMEMOBJ_F_RELAXED);  // flush cache line
+#endif
+				}
+			} else {  // normal update
+/////////////////////////////////////////////
+
+				for (i = 0; i < words; i++) {
+					__atomic_xor_fetch(&parity[i], data[i] ^ newd[i], __ATOMIC_RELAXED);
+#ifdef PANGOLIN_PIPELINE
+					if (((i+1) & 7) == 0) pmemops_xflush(&pop->p_ops, &parity[i-7], 64, PMEMOBJ_F_RELAXED);  // flush cache line
+#endif
+				}
+
+// 				for (i = 0 ;i < flush_batches; i++) {  // unfold the flush branch, no effect
+// 					__atomic_xor_fetch(&parity[i*8  ], data[i*8  ] ^ newd[i*8  ], __ATOMIC_RELAXED);
+// 					__atomic_xor_fetch(&parity[i*8+1], data[i*8+1] ^ newd[i*8+1], __ATOMIC_RELAXED);
+// 					__atomic_xor_fetch(&parity[i*8+2], data[i*8+2] ^ newd[i*8+2], __ATOMIC_RELAXED);
+// 					__atomic_xor_fetch(&parity[i*8+3], data[i*8+3] ^ newd[i*8+3], __ATOMIC_RELAXED);
+// 					__atomic_xor_fetch(&parity[i*8+4], data[i*8+4] ^ newd[i*8+4], __ATOMIC_RELAXED);
+// 					__atomic_xor_fetch(&parity[i*8+5], data[i*8+5] ^ newd[i*8+5], __ATOMIC_RELAXED);
+// 					__atomic_xor_fetch(&parity[i*8+6], data[i*8+6] ^ newd[i*8+6], __ATOMIC_RELAXED);
+// 					__atomic_xor_fetch(&parity[i*8+7], data[i*8+7] ^ newd[i*8+7], __ATOMIC_RELAXED);
+// #ifdef PANGOLIN_PIPELINE
+// 					pmemops_xflush(&pop->p_ops, &(parity[i*8]), 64, PMEMOBJ_F_RELAXED);
+// 					// CLFLUSHOPT_ASM(&(parity[i*8]));
+// #endif
+// 				}
+
+/////////////////////////////////////////////
+#ifdef PANGOLIN_PIPELINE  // not 64B aligned -> an extra flush
+			if (unlikely((i & 7) != 0)) 
+				pmemops_xflush(&pop->p_ops, &parity[i-i%8], 64, PMEMOBJ_F_RELAXED);
+#endif
+			}
+		} else {  // multiple parity, use delta parity to perform atomic ops
+			int buf_len = 4096+256;  // incase buffer overflow?
+			char buf[2 * buf_len];
+			memset(buf, 0, 2 * buf_len);
+			uint64_t *delta_parity[2] = {buf, buf + buf_len};
+			if (newd == NULL) {  // append update
+				gen_delta_parity(ec, data, size, vec_i, NULL, delta_parity);  // gen delta parity with SIMD
+				for (int ii = 0; ii < ec->p; ii++) {
+					for (i = 0; i < words; i++) {
+						__atomic_xor_fetch(&(parities[ii][i]), delta_parity[ii][i], __ATOMIC_RELAXED);
+#ifdef PANGOLIN_PIPELINE
+						if (((i+1) & 7) == 0) pmemops_xflush(&pop->p_ops, &parities[ii][i-7], 64, PMEMOBJ_F_RELAXED);
+#endif
+					}
+				}
+			} else {  // normal update
+				gen_delta_parity(ec, data, size, vec_i, newd, delta_parity);
+				for (int ii = 0; ii < ec->p; ii++) {
+					for (i = 0; i < words; i++) {
+						__atomic_xor_fetch(&(parities[ii][i]), delta_parity[ii][i], __ATOMIC_RELAXED);
+#ifdef PANGOLIN_PIPELINE
+						if (((i+1) & 7) == 0) pmemops_xflush(&pop->p_ops, &parities[ii][i-7], 64, PMEMOBJ_F_RELAXED);
+#endif
+					}
+				}
+			}
+#ifdef PANGOLIN_PIPELINE   // not 64B aligned -> an extra flush
+			if (unlikely((i & 7) != 0)) {  // not 64B aligned -> an extra flush for atomic
+				for (int ii = 0; ii < ec->p; ii++) 
+					pmemops_xflush(&pop->p_ops, &parities[ii][i-i%8], 64, PMEMOBJ_F_RELAXED);
+			}
+#endif
+			// atomic_update_parity_inplace(ec, parities, delta_parity, size);  // should be used to simplify codes
 		}
 	}
 #endif
@@ -208,12 +422,115 @@ pangolin_update_column_parity(PMEMobjpool *pop, uint64_t *data, uint64_t *newd,
 	__atomic_clear(&ort->zone_rclock[zid][rclock],
 		__ATOMIC_RELEASE | __ATOMIC_HLE_RELEASE);
 #else
-	os_rwlock_unlock(&ort->zone_rclock[zid][rclock]);
+	os_rwlock_unlock_wrap(&ort->zone_rclock[zid][rclock]);
 #endif
 
 	return 0;
 }
+
 #endif
+
+/**
+ * pipeline data version of `pangolin_update_column_parity_multi` (update data and gen delta firstly)
+ * @param delta: the obj_delta in obuf, may be delta_data or delta_parity respect to PANGOLIN_PIPELINE_DATA or PANGOLIN_PIPELINE_DATA_2M
+*/
+static int
+pangolin_update_column_parity_multi_pd(PMEMobjpool *pop, uint64_t *data, uint64_t **delta,
+	uint64_t *parity, size_t size, uint32_t zid, uint32_t rclock, uint32_t vec_i)
+{
+	ASSERT(ALIGNED_8(size));  // TODO: meta may have 8B small update, so coding must be full functional
+	ASSERT(ALIGNED_8(parity));
+
+	struct obuf_runtime *ort = obuf_get_runtime();
+	struct ec_runtime *ec = ec_get_runtime();
+	
+	uint64_t *delta_parities[2];
+	if (ec->p == 1) delta_parities[0] = delta[1];
+	else for (int ii = 0; ii < ec->p; ii++) delta_parities[ii] = delta[ii];
+	
+	uint64_t *delta_data = delta[1];
+
+	uint64_t *parities[2];  // parity on PM
+	if (ort->last_zone_id == zid) {
+		parities[0] = parity;
+		if (ec->p != 1) parities[1] = (char *)parity + ort->last_zone_row_size;
+		else parities[1] = NULL;
+	} else {
+		parities[0] = parity;
+		if (ec->p != 1) parities[1] = (char *)parity + ort->zone_row_size;
+		else parities[1] = NULL;
+	}
+
+#ifdef PANGOLIN_RCLOCKHLE // HLE instead of wrlock
+	while (__atomic_exchange_n(&ort->zone_rclock[zid][rclock], 1, __ATOMIC_ACQUIRE | __ATOMIC_HLE_ACQUIRE));
+#else
+	if (size >= ort->rclock_threshold) os_rwlock_wrlock_wrap(&ort->zone_rclock[zid][rclock]);
+	else os_rwlock_rdlock_wrap(&ort->zone_rclock[zid][rclock]);
+
+	if (size >= ort->rclock_threshold) {
+#endif
+		/* SIMD coding */
+#ifndef PANGOLIN_PIPELINE_DATA_2M
+		// delta is delta_data
+		encode_update_pipeline(ec, delta_data, parities, size, vec_i, PANGOLIN_EC_TEMPORAL);
+#else  // delta is delta_parity, no coding, just merge
+		for (int ii = 0; ii < ec->p; ii++) {
+			void *array[3] = {delta_parities[ii], parities[ii], parities[ii]};
+#ifdef PANGOLIN_PIPELINE
+			xor_gen_avx512_pipeline_pgl(3, size, array);
+#else
+			xor_gen_avx512_pgl(3, size, array);
+#endif
+		}
+#endif
+
+#ifndef PANGOLIN_RCLOCKHLE
+	} else {
+		/* atomic coding */
+		size_t words = size >> 3;
+		size_t i = 0;
+		if (ec->p == 1) {  // delta_data == delta_parity -> xor + flush
+			for (i = 0; i < words; i++) {
+				__atomic_xor_fetch(&parity[i], delta_data[i], __ATOMIC_RELAXED);
+#ifdef PANGOLIN_PIPELINE
+				if (unlikely(((i+1) & 7) == 0)) pmemops_xflush(&pop->p_ops, &parity[i-7], 64, PMEMOBJ_F_RELAXED);  // flush cache line
+#endif
+			}
+#ifdef PANGOLIN_PIPELINE
+			if (unlikely((i & 7) != 0)) pmemops_xflush(&pop->p_ops, &parity[i-i%8], 64, PMEMOBJ_F_RELAXED);
+#endif
+		} else {  // multiple parity, delta data -> delta parity, to perform atomic ops
+			// gen delta_parity
+	#ifndef PANGOLIN_PIPELINE_DATA_2M
+			encode_update(ec, delta_data, delta_parities, size, vec_i, PANGOLIN_EC_TEMPORAL);  // since delta_data is the last delta_parities, inplace works
+	#endif
+			// merge delta_parity to parities
+			for (int ii = 0; ii < ec->p; ii++) {
+				for (i = 0; i < words; i++) {
+					__atomic_xor_fetch(&(parities[ii][i]), delta_parities[ii][i], __ATOMIC_RELAXED);
+#ifdef PANGOLIN_PIPELINE
+					if (((i+1) & 7) == 0) pmemops_xflush(&pop->p_ops, &parities[ii][i-7], 64, PMEMOBJ_F_RELAXED);
+#endif
+				}
+			}
+#ifdef PANGOLIN_PIPELINE
+			if (unlikely((i & 7) != 0)) {  // not 64B aligned -> an extra flush for atomic
+				for (int ii = 0; ii < ec->p; ii++) pmemops_xflush(&pop->p_ops, &parities[ii][i-i%8], 64, PMEMOBJ_F_RELAXED);
+			}
+#endif
+		}
+	}
+#endif
+
+#ifdef PANGOLIN_RCLOCKHLE
+	__atomic_clear(&ort->zone_rclock[zid][rclock],
+		__ATOMIC_RELEASE | __ATOMIC_HLE_RELEASE);
+#else
+	os_rwlock_unlock_wrap(&ort->zone_rclock[zid][rclock]);
+#endif
+
+	return 0;
+}
 
 int
 pangolin_atomic_xor(PMEMobjpool *pop, void *src1, void *src2, void *dst,
@@ -250,10 +567,33 @@ pangolin_avx_xor(PMEMobjpool *pop, void *src1, void *src2, void *dst,
 	ASSERT(ALIGNED_32(size));
 
 	void *array[4] = {src1, src2, dst, dst};
-	xor_gen_avx(4, size, array);
+	xor_gen_avx_pgl(4, size, array);
 
 	pmemops_persist(&pop->p_ops, dst, size);
 #endif
+	return 0;
+}
+
+/*
+ * get parity addr based on data addr
+*/
+// void *
+// pangolin_parity_addr(PMEMobjpool *pop, void *data, void *newd, size_t size)
+// {
+// #ifdef PANGOLIN_PARITY
+
+// #endif
+// 	return NULL
+// }
+
+/*
+ * only called by update with redolog
+*/
+int
+pangolin_update_data(PMEMobjpool *pop, void *src, void *dst, size_t size)
+{	
+	pmemops_memcpy(&pop->p_ops, dst, src, size,
+		PMEMOBJ_F_MEM_WC | PMEMOBJ_F_MEM_NODRAIN);
 	return 0;
 }
 
@@ -263,37 +603,65 @@ pangolin_avx_xor(PMEMobjpool *pop, void *src1, void *src2, void *dst,
  * Content of [data : data + size) will change to [newd : newd + size), as a
  * result of a store or memcpy-kind of operation.
  *
+ * newd may be delta in some variants
  * Address of data determines the affected parity region. If newd is not NULL,
  * parity = parity XOR (data XOR newd); otherwise parity = parity XOR data.
  */
 int
-pangolin_update_parity(PMEMobjpool *pop, void *data, void *newd, size_t size)
+pangolin_update_parity(PMEMobjpool *pop, void *data, void *newd, size_t size) 
 {
+	return pangolin_update_parity_x(pop, data, newd, size, 0);
+}
+/*
+ * data=dst, newd=delta
+ * controlled by PANGOLIN_PIPELINE_DATA, PANGOLIN_PIPELINE, PANGOLIN_RCLOCKHLE
+ * the delta is 1dim ptr
+*/
+int
+pangolin_update_parity_x(PMEMobjpool *pop, void *data, void *newd_or_delta, size_t size, uint8_t newd_is_delta)
+{
+	uint64_t *delta[2] = {NULL, NULL};
+	void *newd = NULL;
+	if (newd_is_delta) {  // delta
+		delta[0] = (uint64_t *) newd_or_delta;
+		delta[1] = delta[0] + size/8;
+		newd = (void *) delta[0];
+	} else {
+		newd = newd_or_delta;
+	}
+
 #ifdef PANGOLIN_PARITY
 	/* size should always be 8-byte (or more) aligned */
 	ASSERT(ALIGNED_8(data));
-	ASSERT(ALIGNED_8(size));
 	ASSERT(ALIGNED_8(newd));
+	ASSERT(ALIGNED_8(size));
 
 	ASSERT(OBJ_PTR_FROM_POOL(pop, data));
-	struct obuf_runtime *ort = obuf_get_runtime();
 
+	uint64_t offset;
+	uint16_t vec_i;
+	void *parity_ptr;
+	uint32_t zid = 0;
+
+	struct obuf_runtime *ort = obuf_get_runtime();
+	// calculate parity position by the address info of ort
 	void *heap_start = (char *)pop + pop->heap_offset;
 	/* offset to the start of zone0 */
-	uint64_t offset = (uint64_t)data - (uint64_t)heap_start -
-		sizeof(struct heap_header);
+	offset = (uint64_t)data - (uint64_t)heap_start -
+		sizeof(struct heap_header);  // the global offset of data relative to heap
+
+// #ifndef PANGOLIN_PIPELINE_DATA_2M
 	/*
 	 * compute offset / ZONE_MAX_SIZE
 	 * ZONE_MAX_SIZE is 16 GB so the while loop will not take many rounds.
 	 */
-	uint32_t zid = 0;
 	while (offset >= ZONE_MAX_SIZE) {
 		zid += 1;
 		offset -= ZONE_MAX_SIZE;
 	}
-	struct zone *z = ZID_TO_ZONE(heap_start, zid);
-
-	uint64_t row_size, parity_start;
+	struct zone *z = ZID_TO_ZONE(heap_start, zid);  // the address of libpmemobj's zone get from zid
+	uint64_t row_size;
+	uint64_t parity_start;  // parity offset
 	if (zid != ort->last_zone_id) {
 		row_size = ort->zone_row_size;
 		parity_start = ort->zone_parity;
@@ -301,21 +669,43 @@ pangolin_update_parity(PMEMobjpool *pop, void *data, void *newd, size_t size)
 		row_size = ort->last_zone_row_size;
 		parity_start = ort->last_zone_parity;
 	}
-
 	/* offset into the zone's chunks */
 	offset -= sizeof(struct zone);
 	/* offset into the resident data chunk group */
-	while (offset >= row_size)
+	vec_i = 0;  // needed when updating multi-parity
+	while (offset >= row_size) {
 		offset -= row_size;
+		vec_i += 1;
+	}
+
+// #else
+// // read the previous computed results in obuf (skip the loop in computation)
+// 	offset = obuf->p_offset;
+// 	vec_i = obuf->p_vec_i;
+// 	zid = obuf->p_zid;
+// 	struct zone *z = ZID_TO_ZONE(heap_start, zid);
+// 	uint64_t row_size;
+// 	uint64_t parity_start;  // parity offset
+// 	if (zid != ort->last_zone_id) {
+// 		row_size = ort->zone_row_size;
+// 		parity_start = ort->zone_parity;
+// 	} else {
+// 		row_size = ort->last_zone_row_size;
+// 		parity_start = ort->last_zone_parity;
+// 	}
+// #endif
+
+	parity_ptr = (char *)z + parity_start + offset;
 
 	uint32_t rclock = (uint32_t)(offset >> RCLOCKSHIFT);
 
-	size_t parity_size = size;
-	void *parity_ptr = (char *)z + parity_start + offset;
 	/* off: offset within a page; len: bytes to update within a page */
+	
+	size_t parity_size = size;
+
 	uint64_t *parity, off, len;
 	while (size > 0) {
-		ASSERT(offset < row_size);
+		// ASSERT(offset < row_size);
 		ASSERT(ALIGNED_8(offset));
 
 		/*
@@ -326,10 +716,21 @@ pangolin_update_parity(PMEMobjpool *pop, void *data, void *newd, size_t size)
 		off = offset & ((uint64_t)RCLOCKSIZE - 1);
 		len = (off + size < RCLOCKSIZE) ? size : RCLOCKSIZE - off;
 
-		parity = (uint64_t *)((char *)z + parity_start + offset);
+		parity = (uint64_t *)((char *)z + parity_start + offset);  // iterator
+
 		ASSERT(OBJ_PTR_FROM_POOL(pop, parity));
-		pangolin_update_column_parity(pop, data, newd, parity,
-			len, zid, rclock);
+
+		// update parity! calculate parity position, rclock is lock id
+		// pangolin_update_column_parity(pop, data, newd, parity, len, zid, rclock);  // xor version
+		
+#ifndef PANGOLIN_PIPELINE_DATA
+		pangolin_update_column_parity_multi(pop, data, newd, parity, len, zid, rclock, vec_i);  // multi-parity version
+#else
+		if (newd_is_delta) 
+			pangolin_update_column_parity_multi_pd(pop, data, delta, parity, len, zid, rclock, vec_i);  // pipeline data version (newd is delta)
+		else
+			pangolin_update_column_parity_multi(pop, data, newd, parity, len, zid, rclock, vec_i);
+#endif
 
 		rclock += 1;
 		size -= len;
@@ -344,9 +745,29 @@ pangolin_update_parity(PMEMobjpool *pop, void *data, void *newd, size_t size)
 			newd = (char *)newd + len;
 	}
 
-	/* sfence (drain) will execute after obuf_tx_heap_commit() */
-	pmemops_xpersist(&pop->p_ops, parity_ptr, parity_size,
-		PMEMOBJ_F_RELAXED);
+#ifndef PANGOLIN_PIPELINE
+	// call clwb for dirty parity, and because of outside sfence, sfence (drain) will execute after obuf_tx_heap_commit() */
+	pmemops_xflush(&pop->p_ops, parity_ptr, parity_size, PMEMOBJ_F_RELAXED);
+	// for (int i = 0; i < parity_size; i+=64) {
+	// 	CLFLUSHOPT_ASM((char*)parity_ptr+i);
+	// }
+
+	// flush other parity rows
+	struct ec_runtime *ec = ec_get_runtime();
+	if (ec->p != 1) {
+		for (int i = 1; i < ec->p; i++) {
+			if (zid != ort->last_zone_id)
+				pmemops_xflush(&pop->p_ops, 
+							(char *)parity_ptr + i*ort->zone_row_size,
+							parity_size, PMEMOBJ_F_RELAXED);
+			else
+				pmemops_xflush(&pop->p_ops, 
+							(char *)parity_ptr + i*ort->last_zone_row_size,
+							parity_size, PMEMOBJ_F_RELAXED);
+		}
+	}
+#endif
+
 #endif
 
 	return 0;
@@ -566,10 +987,10 @@ pangolin_repair_corruption(void *ptr, size_t size, int hwe, struct objbuf *obuf)
 	}
 
 	void *heap_start = (char *)pop + pop->heap_offset;
-	struct zone *z = ZID_TO_ZONE(heap_start, zid);
+	struct zone *z = ZID_TO_ZONE(heap_start, zid);  // ptr->offset(all)->zid->zone
 
 	uint32_t rows, badrow = 0;
-	uint64_t row_size, parity_start;
+	uint64_t row_size, parity_start;  // get addr of row_size and parity_start
 	if (zid != ort->last_zone_id) {
 		rows = ort->zone_rows;
 		row_size = ort->zone_row_size;
@@ -586,12 +1007,12 @@ pangolin_repair_corruption(void *ptr, size_t size, int hwe, struct objbuf *obuf)
 	/* offset into the zone's chunks */
 	offset -= sizeof(struct zone);
 	/* offset into the resident data chunk group */
-	while (offset >= row_size) {
+	while (offset >= row_size) {  // which row is bad
 		badrow += 1;
 		offset -= row_size;
 	}
 
-	char *first_row = (char *)z + sizeof(struct zone);
+	char *first_row = (char *)z + sizeof(struct zone); // meta
 	char *parity_row = (char *)z + parity_start;
 
 	/* an object may wrap around a row */
@@ -612,7 +1033,7 @@ pangolin_repair_corruption(void *ptr, size_t size, int hwe, struct objbuf *obuf)
 		/* skipping the bad row and parity row */
 		if (r != badrow) {
 			void *array[3] = {dataptr, repbuf, repbuf};
-			xor_gen_sse(3, size1, array);
+			xor_gen_sse_pgl(3, size1, array);
 		}
 		dataptr += row_size;
 	}
@@ -632,7 +1053,7 @@ pangolin_repair_corruption(void *ptr, size_t size, int hwe, struct objbuf *obuf)
 		for (uint32_t r = 0; r < rows - 1; r++) {
 			if (r != badrow) {
 				void *array[3] = {dataptr, xorptr, xorptr};
-				xor_gen_sse(3, size2, array);
+				xor_gen_sse_pgl(3, size2, array);
 			}
 			dataptr += row_size;
 		}
@@ -691,22 +1112,22 @@ signal_hdl(int sig, siginfo_t *siginfo, void *ptr)
 int
 pangolin_register_sighdl(void)
 {
-	struct sigaction sigbus_act;
-	struct sigaction sigsegv_act;
+	// struct sigaction sigbus_act;
+	// struct sigaction sigsegv_act;
 
-	memset(&sigbus_act, 0, sizeof(sigbus_act));
-	sigbus_act.sa_sigaction = signal_hdl;
-	sigbus_act.sa_flags = SA_SIGINFO;
+	// memset(&sigbus_act, 0, sizeof(sigbus_act));
+	// sigbus_act.sa_sigaction = signal_hdl;
+	// sigbus_act.sa_flags = SA_SIGINFO;
 
-	if (sigaction(SIGSEGV, &sigbus_act, 0))
-		FATAL("sigaction error!");
+	// if (sigaction(SIGSEGV, &sigbus_act, 0))
+	// 	FATAL("sigaction error!");
 
-	memset(&sigsegv_act, 0, sizeof(sigsegv_act));
-	sigsegv_act.sa_sigaction = signal_hdl;
-	sigsegv_act.sa_flags = SA_SIGINFO;
+	// memset(&sigsegv_act, 0, sizeof(sigsegv_act));
+	// sigsegv_act.sa_sigaction = signal_hdl;
+	// sigsegv_act.sa_flags = SA_SIGINFO;
 
-	if (sigaction(SIGSEGV, &sigsegv_act, 0))
-		FATAL("sigaction error!");
+	// if (sigaction(SIGSEGV, &sigsegv_act, 0))
+	// 	FATAL("sigaction error!");
 
 	return 0;
 }
@@ -846,7 +1267,8 @@ uint32_t
 pangolin_adler32(uint32_t init, void *data, size_t len)
 {
 #ifdef PANGOLIN_CHECKSUM
-	return adler32_sse(init, data, len);
+	// return adler32_sse(init, data, len);
+	return adler32_avx2_4(init, data, len);  // use avx2
 #else
 	return adler32_base(init, data, len);
 #endif
@@ -1017,17 +1439,17 @@ pangolin_check_zone(PMEMobjpool *pop, uint32_t zid, int repair)
 	struct obuf_runtime *ort = obuf_get_runtime();
 
 	uint32_t rows = ort->zone_rows;
-	uint32_t chunks = (uint32_t)(ort->zone_row_size / CHUNKSIZE);
+	uint32_t chunks = (uint32_t)(ort->zone_row_size / CHUNKSIZE);  // how many chunks in a row, chunks are vertically oriented
 	if (zid == ort->last_zone_id) {
 		rows = ort->last_zone_rows;
 		chunks = (uint32_t)(ort->last_zone_row_size / CHUNKSIZE);
 	}
 
 	/* Verify per chunk-column. */
-	uint32_t data_size = CHUNKSIZE;
+	uint32_t data_size = CHUNKSIZE;  // the granularity of the row to be checked is 256KB
 	uint32_t data_words = data_size >> 3;
 	/* Align for using SSE/AVX instructions. */
-	uint64_t *xors = util_aligned_malloc(CACHELINE_SIZE, data_size);
+	uint64_t *xors = util_aligned_malloc(CACHELINE_SIZE, data_size);  // 256KB
 	if (!xors) {
 		obuf_destroy_runtime(ort->pop);
 		FATAL("util_aligned_malloc() failed");
@@ -1037,15 +1459,15 @@ pangolin_check_zone(PMEMobjpool *pop, uint32_t zid, int repair)
 	uint32_t c, r, i;
 	for (c = 0; c < chunks && !err; c++) {
 		void *data;
-		for (r = 0; r < rows; r++) {
+		for (r = 0; r < rows; r++) {  // xor all data into xor
 			data = &z->chunks[r * chunks + c];
 			void *array[3] = {data, xors, xors};
-			xor_gen_sse(3, data_size, array);
+			xor_gen_sse_pgl(3, data_size, array);
 		}
 
 		data = &z->chunks[c];
 		for (i = 0; i < data_words; i++) {
-			if (xors[i] != 0) {
+			if (xors[i] != 0) {  // check 64bit/8B
 				err += 1;
 				LOG_ERR("chunk column xor error - zone %u "
 					"[%u rows %u cols] column %u word %u "
@@ -1137,6 +1559,7 @@ pangolin_check_dscp(PMEMobjpool *pop, int repair)
 
 /*
  * pangolin_check_lanes -- check lanes integrity and repair
+ * struct lane_layout: internal, external, undo
  */
 static int
 pangolin_check_lanes(PMEMobjpool *pop, int repair)
@@ -1185,9 +1608,9 @@ pangolin_check_pool(PMEMobjpool *pop, int repair)
 {
 	int err = 0;
 
-	err += pangolin_check_dscp(pop, repair);
+	err += pangolin_check_dscp(pop, repair);  // replicated dscp
 	err += pangolin_check_heap(pop, repair);
-	err += pangolin_check_lanes(pop, repair);
+	err += pangolin_check_lanes(pop, repair); // replicated lane_layout
 
 	return err;
 }
@@ -1200,8 +1623,9 @@ pangolin_check_objs(PMEMobjpool *pop, int repair)
 {
 #ifdef PANGOLIN_CHECKSUM
 	PMEMoid oid;
+	struct obuf_runtime *ort = obuf_get_runtime();
 	POBJ_FOREACH(pop, oid) {
-		void *pobj = pmemobj_direct(oid);
+		void *pobj = pmemobj_direct(oid);  // pointer to data area
 		uint32_t csum = pangolin_adler32(CSUM0, pobj, USIZE(pobj));
 		if (OHDR(pobj)->csum != csum) {
 			LOG_ERR("object checksum error - oid.off 0x%lx, "
@@ -1211,7 +1635,23 @@ pangolin_check_objs(PMEMobjpool *pop, int repair)
 		}
 	}
 #endif
+	return 0;
+}
 
+/*
+ * pangolin_check_obj_one -- check one object integrity
+ * @param pobj: pointer to the object, `pobj = pmemobj_direct(oid)`
+*/
+int
+pangolin_check_obj_one(uint64_t *pobj)
+{
+#ifdef PANGOLIN_CHECKSUM
+	uint32_t csum = pangolin_adler32(CSUM0, pobj, USIZE(pobj));
+	if (OHDR(pobj)->csum != csum) {
+		LOG_ERR("object checksum error (pangolin_check_obj_one)");
+		return 1;
+	}
+#endif
 	return 0;
 }
 
@@ -1401,5 +1841,236 @@ pangolin_setup_scrub(PMEMobjpool *pop, struct obuf_runtime *ort)
 			ort->scrub_sec, ort->scrub_msec);
 	}
 
+	return 0;
+}
+
+#define CHUNK_HDR_SIZE 320
+
+/*
+ * DEPRECATED!
+ * multi-thread scan zone worker
+ * some simple OPTs: 1) directly avx512 cmp with parity, 2) mv alloc to external, 3) rm some parts e.g. check meta
+*/
+// void *
+// pangolin_scan_worker_obj(void * args_thread)
+// {	
+// 	// load params
+// 	thread_param * args = (thread_param *) args_thread;
+// 	uint32_t chunks = args->chunks;
+// 	uint32_t rows = args->rows;
+// 	uint64_t * xors_local = args->xors_local;
+// 	struct objhdr * data_buf_local = args->data_buf_local;
+// 	struct zone *z = args->z;
+// 	size_t obj_size = args->obj_size;
+
+// 	uint32_t c_start = args->c_start;
+// 	uint32_t c_end = args->c_end;
+
+// 	// scan objsize as chunksize for cache friendly
+// 	uint32_t num_obj_per_chunk = CHUNKSIZE / obj_size;
+// 	uint32_t c = 0;
+// 	for (c = c_start; c < c_end; c++) {  // scan this chunk level stripe
+// 		uint32_t i_obj = 0;  // scan the i_th obj in this chunk
+// 		for (i_obj = 0; i_obj < num_obj_per_chunk; i_obj++) {  // scan obj
+// 			uint32_t r = 0;
+// 			memset(xors_local, 0, obj_size);
+// 			for (r = 0; r < rows-1; r++) {  // encoding all data rows
+// 				void *data = &z->chunks[r * chunks + c];  // chunk raw pointer including obj's header
+// 				struct objhdr * obj = (struct objhdr *) ((uintptr_t) data + CHUNK_HDR_SIZE + i_obj * obj_size);
+// 				if (obj->size!=obj_size) break;  // not filled
+
+// 				memcpy(data_buf_local, obj, obj_size);
+// 				uint32_t csum_old = 0;
+// 				uint32_t csum = 0;
+// 				csum_old = data_buf_local->csum;
+				
+// 				void * obj_data = REAL_REVERSE(data_buf_local);
+// 				size_t obj_usize = USIZE(obj_data);
+// 				csum = pangolin_adler32(CSUM0, obj_data, obj_usize); // csum validation
+// 				if (csum_old != csum) continue;   // @TODO: recover broken data
+				
+// 				void *array[3] = {data_buf_local, xors_local, xors_local};  // do encoding in objsize granularity
+// 				xor_gen_avx512(3, obj_size, array);
+// 			}  // finish encoding
+			
+// 			// compare with stored parity
+// 			uintptr_t parity = &z->chunks[(rows-1)*chunks + c];
+// 			if (memcmp(xors_local, parity + CHUNK_HDR_SIZE + i_obj * obj_size, obj_size)) continue;
+// 			// TODO: recover broken data
+// 		}
+
+// 	}
+// 	return NULL;
+// }
+
+/**
+ * inject ramdom error in data
+ * 
+ */
+#define ERROR_RATE 1/1000000000 // 10e−9 to 10e−4
+void error_injection(char * data, size_t len) {
+	uint32_t * p = (uint32_t *)data;
+	// TODO
+
+}
+
+/*
+ * multi-thread scan zone worker
+ * some simple OPTs: 1) directly avx512 cmp with parity, 2) mv alloc to external, 3) rm some parts e.g. check meta
+ * TODO: maybe read PM directly is faster? any cache friendly write?
+*/
+void *
+pangolin_scan_worker_chunk(void * args_thread)
+{	
+	// load params
+	thread_param * args = (thread_param *) args_thread;
+	uint32_t chunks = args->chunks;
+	uint32_t rows = args->rows;
+	// uint64_t * xors_local = args->xors_local;
+	uint64_t * data_buf_local = args->data_buf_local;
+	struct zone *z = args->z;
+	size_t obj_size = args->obj_size;
+	size_t num_parity = args->num_parity;
+	uint64_t ** parity_local = args->parity_local;
+
+	uint32_t c_start = args->c_start;
+	uint32_t c_end = args->c_end;
+
+	uint32_t c;
+	uint32_t r;
+	struct objhdr * obj = NULL;
+
+	for (c = c_start; c < c_end; c++) {  // scan this chunk level stripe
+		uint8_t flag_no_csum = 0;  // // not filled -> no re-checksum
+		
+		// read to DRAM buffer, check csum, gen new parity
+		for (r = 0; r < rows - num_parity; r++) {
+			void *data = &z->chunks[r * chunks + c];  // chunk raw pointer, including obj's header
+			memcpy(data_buf_local, data, CHUNKSIZE);  // read PM data to DRAM buffer
+			/* scan this chunk and valid csum */
+			for (uintptr_t ptr_offset = CHUNK_HDR_SIZE; flag_no_csum!=1 && ptr_offset < CHUNKSIZE - obj_size; ptr_offset += obj_size) {
+				uint32_t csum_old = 0;
+				uint32_t csum = 0;
+				obj = (struct objhdr *) ((uintptr_t) data_buf_local + ptr_offset);
+				if (obj->size != obj_size) {  // not filled
+					flag_no_csum = 1;
+					break;
+				}
+				csum_old = obj->csum;
+				
+				void * obj_data = REAL_REVERSE(obj);
+				size_t obj_usize = USIZE(obj_data);
+				csum = pangolin_adler32(CSUM0, obj_data, obj_usize);
+				if (csum_old != csum) {
+					// TODO: recover broken data (checksum)
+				}
+				
+			}
+			struct ec_runtime *ec = ec_get_runtime();
+			encode_update(ec, data_buf_local, parity_local, CHUNKSIZE, r, PANGOLIN_EC_TEMPORAL);
+		}
+
+
+		// compare coded parity and stored parity
+		for (int i = 0; i < num_parity; i++) {
+			void *parity = &z->chunks[(rows-num_parity+i)*chunks + c];
+				if (memcmp(parity_local[i], parity, CHUNKSIZE)) {
+					// TODO: recover broken parity
+				}
+			}
+		// clean parity_local
+		for (int i = 0; i < num_parity; i++) memset(parity_local[i], 0, CHUNKSIZE);
+	}
+	return NULL;
+}
+
+/*
+ * Scan a zone with zid. 
+ * refer to pangolin_check_zone()
+ * TODO: only scan, assume no errors, no write back
+*/
+static int
+pangolin_scan_zone(PMEMobjpool *pop, uint32_t zid, int repair, uint32_t num_thread, uint32_t num_parity)
+{
+#ifdef PANGOLIN_PARITY
+	void *heap_start = (char *)pop + pop->heap_offset;
+	struct zone *z = ZID_TO_ZONE(heap_start, zid);
+	if (!z) return 1;
+	pangolin_clear_ulogs(pop);  // clean overflow logs
+	struct obuf_runtime *ort = obuf_get_runtime();
+
+	uint32_t rows = ort->zone_rows;
+	uint32_t chunks = (uint32_t)(ort->zone_row_size / CHUNKSIZE);
+	if (zid == ort->last_zone_id) {
+		rows = ort->last_zone_rows;
+		chunks = (uint32_t)(ort->last_zone_row_size / CHUNKSIZE);
+	}
+
+	void * tmp = &z->chunks[0];
+	size_t obj_size = ((struct objhdr *) ((uintptr_t) tmp + CHUNK_HDR_SIZE))->size;
+
+	/*
+	 * assign different chunks to different physical threads
+	*/
+	pthread_t *threads = (pthread_t *) malloc(num_thread * sizeof(pthread_t));
+    for (int i = 0; i < num_thread; i++) {
+        pthread_t t = 0;
+        threads[i] = t;
+    }
+    thread_param *args_array = (thread_param *) malloc(num_thread * sizeof(thread_param));
+	for (int i = 0; i < num_thread; i++) {
+		thread_param *args = &args_array[i];
+		// split chunks for different thread
+		args->c_start = i * chunks / num_thread;
+		if (i != num_thread - 1)
+			args->c_end = (i+1) * chunks / num_thread;
+		else
+			args->c_end = chunks;
+		args->chunks = chunks;
+		args->rows = rows;
+		args->z = z;
+		args->obj_size = obj_size;
+		args->data_buf_local = util_aligned_malloc(CACHELINE_SIZE, CHUNKSIZE);  // read all data to DRAM buffer
+		memset(args->data_buf_local, 0, CHUNKSIZE * (rows-num_parity));
+		args->num_parity = num_parity;
+		// args->xors_local = util_aligned_malloc(CACHELINE_SIZE, CHUNKSIZE);
+		args->parity_local = util_aligned_malloc(sizeof(uint64_t *), num_parity);
+		for (int j = 0; i < num_parity; i++) {
+			args->parity_local[j] = util_aligned_malloc(CACHELINE_SIZE, CHUNKSIZE);
+			memset(args->parity_local[j], 0, CHUNKSIZE);
+		}
+		pthread_create(&threads[i], NULL, pangolin_scan_worker_chunk, args);  
+	}
+	for (int i = 0; i < num_thread; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+	// free
+	// for (int i = 0; i < num_thread; i++) {
+	// 	thread_param *args = &args_array[i];
+	// 	args->xors_local = util_aligned_malloc(CACHELINE_SIZE, CHUNKSIZE);;
+	// 	args->data_buf_local = util_aligned_malloc(CACHELINE_SIZE, CHUNKSIZE);
+	// }
+	free(args_array);
+
+#endif
+	return 0;
+}
+
+/*
+ * refet to pangolin_check_heap() and pangolin_check_pool()
+ * scan whole heap for crash recovery
+ * TODO: only support basic scan now! no reconstruct support
+*/
+int
+pangolin_scan(PMEMobjpool *pop, int repair, size_t num_thread, size_t num_parity)
+{
+	struct obuf_runtime *ort = obuf_get_runtime();
+	// TODO: now only zone-level parallel, can extend to cross-zone
+	for (uint32_t zid = 0; zid < ort->nzones; zid++) {
+		if (pangolin_scan_zone(pop, zid, repair, num_thread, num_parity)) {
+			return 1;
+		}
+	}
 	return 0;
 }

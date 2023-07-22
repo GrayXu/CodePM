@@ -1,4 +1,4 @@
-/*
+	/*
  * Copyright 2017-2018, University of California, San Diego
  *
  * Redistribution and use in source and binary forms, with or without
@@ -89,9 +89,11 @@ struct objhdr {
 	OBJHDR;
 };
 
-#define OHDR_SIZE	(sizeof(struct allocation_header_compact))
+// because obj ptr has a 16B header, so the following macros are used to help
+#define OHDR_SIZE	(sizeof(struct allocation_header_compact))  // 16B space, corresponding to OBJHDR
 /* get the real allocated memory reference from an object pointer */
 #define REAL(obj)	((void *)((uintptr_t)obj - OHDR_SIZE))
+#define REAL_REVERSE(obj)	((void *)((uintptr_t)obj + OHDR_SIZE))  // +16B to data ptr
 /* get the object header reference from an object pointer */
 #define OHDR(obj)	((struct objhdr *)REAL(obj))
 /* get the usable size from an object pointer */
@@ -109,6 +111,7 @@ struct obuf_pool {
 struct obuf_shared_slot {
 	int lock;
 	/* a key-value store data structure to map an oid (pobj) to an objbuf */
+	// But it can also be said that things in the form of obj lib all need to track obj, so it still maintains an extra objbuf
 	struct cuckoo *kvs;
 #ifdef PROBE
 	size_t inserts;
@@ -169,12 +172,15 @@ struct obuf_runtime {
 
 	uint32_t nzones; /* number of zones of this pool */
 
-	/* max-sized zone's chunk arrays; one reserved as parity */
+	/* max-sized zone's chunk arrays; part of rows reserved as parity */
 	uint32_t zone_rows;
+	uint32_t zone_rows_parity;
+
 	/* max-sized zone's chunk array size in bytes */
 	uint64_t zone_row_size;
-	/* parity's start byte offset into a max-sized zone */
+	/* parity's start byte offset into a max-sized zone, parity's offset in zone */
 	uint64_t zone_parity;
+	uint64_t zone_parity_1;  // 2nd parity, zone_parity_1=zone_parity+zone_row_size
 
 	/*
 	 * range-column locks per zone
@@ -196,14 +202,16 @@ struct obuf_runtime {
 	 */
 	uint32_t last_zone_id;
 	uint32_t last_zone_rows;
+	uint32_t last_zone_rows_parity;
 	uint64_t last_zone_row_size;
 	uint64_t last_zone_parity;
+	uint64_t last_zone_parity_1;  // last_zone_parity_1=last_zone_parity+last_zone_row_size
 
 	/*
 	 * range size threshold for taking the parity range-lock and using
 	 * SIMD instructions (non-atomic) for parity update.
 	 */
-	size_t rclock_threshold;
+	size_t rclock_threshold;  // 64B as default, or env $PANGOLIN_RCLOCK_THRESHOLD
 
 	int get_verify_csum; /* verify every object's checksum with pgl_get */
 
@@ -308,13 +316,17 @@ enum obuf_action {
 /* modified ranges within an objbuf */
 #define OBUF_SRANGES	(4)
 /* object buffer structure */
-/* canary bytes */
+/* canary bytes, a magic number */
 #define OBUF_CANARY	(0x12345678)
+
+/**
+ * object's shadow buffer (micro-buffer)
+*/
 struct objbuf {
-	uint32_t canary;
+	uint32_t canary;  // canary for validation
 	uint32_t disp; /* displacement for cache-line alignment */
 	PMEMobjpool *pop; /* virtual address of the object's pool */
-	void *pobj; /* virtual address of pmem object, excl. alloc header */
+	void *pobj; /* PM data addr. virtual address of pmem object, excl. alloc header */
 	uint32_t txid; /* max txid is #lanes, which should fit 32 bits */
 	enum obuf_state state;
 	SLIST_ENTRY(objbuf) txobj;
@@ -324,7 +336,12 @@ struct objbuf {
 		uint64_t sranges;
 	};
 
+#ifdef PANGOLIN_PIPELINE_DATA
+	// uint64_t **obj_delta;  // -> 2*size, get from alloc
+	uint64_t *obj_delta;  // the delta buffer start addr
+#else
 	uint64_t unused[1]; /* can be mrange */
+#endif
 
 	union { /* large range, multiples of 32 bytes */
 		uint32_t lrange[2]; /* large range start, end */
@@ -347,7 +364,7 @@ struct objbuf {
 		OBJHDR;
 	};
 
-	/* user's object data */
+	/* DRAM user's object data (as new data to be flushed)*/
 	uint8_t uobj[];
 } __attribute__((packed));
 
@@ -357,6 +374,26 @@ struct objbuf {
 #define OBUF_META_SIZE	(OBUF_UOBJ_OFF - OHDR_SIZE)
 /* get the objbuf reference from uobj */
 #define OBUF(uobj)	((struct objbuf *)((uintptr_t)uobj - OBUF_UOBJ_OFF))
+
+/**
+ * scan thread metadata
+*/
+typedef struct thread_param {
+	uint32_t c_start;
+	uint32_t c_end;
+
+	// uint64_t * xors_local;  // deprecated
+	uint64_t ** parity_local;
+	size_t num_parity;
+
+	uint64_t * data_buf_local;
+
+	uint32_t chunks;
+	uint32_t rows;
+	struct zone *z;
+	size_t obj_size;
+
+} thread_param;
 
 /* ---------------------------- static functions ---------------------------- */
 
@@ -504,7 +541,13 @@ uint32_t
 pangolin_adjust_zone_size(uint32_t zone_id);
 
 int
+pangolin_update_data(PMEMobjpool *pop, void *src, void *dst, size_t size);
+
+int
 pangolin_update_parity(PMEMobjpool *pop, void *data, void *diff, size_t size);
+
+int
+pangolin_update_parity_x(PMEMobjpool *pop, void *data, void *diff, size_t size, uint8_t newd_is_delta);
 
 void
 pangolin_rebuild_lane_context(struct operation_context *ctx);

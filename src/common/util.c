@@ -41,6 +41,7 @@
 #include <endian.h>
 #include <errno.h>
 #include <time.h>
+#include <gperftools/tcmalloc.h>
 
 #include "util.h"
 #include "valgrind_internal.h"
@@ -54,10 +55,15 @@ unsigned long long Mmap_align;
 /*
  * our versions of malloc & friends start off pointing to the libc versions
  */
-Malloc_func Malloc = malloc;
-Free_func Free = free;
-Realloc_func Realloc = realloc;
+// Malloc_func Malloc = malloc;
+// Free_func Free = free;
+// Realloc_func Realloc = realloc;
 Strdup_func Strdup = strdup;
+
+// use tcmalloc
+Malloc_func Malloc = tc_malloc;
+Free_func Free = tc_free;
+Realloc_func Realloc = tc_realloc;
 
 /*
  * Zalloc -- allocate zeroed memory

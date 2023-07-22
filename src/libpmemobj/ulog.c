@@ -503,12 +503,12 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 	 * last_cacheline[] by leveraging the cache line alignment of an objbuf.
 	 */
 
-	size_t bdatasize = CACHELINE_SIZE - sizeof(struct ulog_entry_buf);
+	size_t bdatasize = CACHELINE_SIZE - sizeof(struct ulog_entry_buf);  // should be 4, a extra trick for cl alignment
 	size_t ncopy = MIN(size, bdatasize);
 	memcpy(b->data, src, ncopy);
 	memset(b->data + ncopy, 0, bdatasize - ncopy);
 
-	size_t remaining_size = ncopy > size ? 0 : size - ncopy;
+	size_t remaining_size = ncopy > size ? 0 : size - ncopy;  // size = ncopy + rcopy + lcopy
 
 	char *srcof = (char *)src + ncopy;
 	size_t rcopy = ALIGN_DOWN(remaining_size, CACHELINE_SIZE);
@@ -523,15 +523,18 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 	if (rcopy != 0) {
 		void *dest = e->data + ncopy;
 		ASSERT(IS_CACHELINE_ALIGNED(dest));
-
+#ifndef PANGOLIN_LOGFREE
 		VALGRIND_ADD_TO_TX(dest, rcopy);
 		pmemops_memcpy(p_ops, dest, srcof, rcopy,
 			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+#endif
 		VALGRIND_REMOVE_FROM_TX(dest, rcopy);
-#ifdef PANGOLIN_LOGREP
+#ifndef PANGOLIN_LOGFREE
+	#ifdef PANGOLIN_LOGREP
 		void *destrep = pangolin_repaddr(p_ops->base, dest);
 		pmemops_memcpy(p_ops, destrep, srcof, rcopy,
 			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+	#endif
 #endif
 	}
 
@@ -540,13 +543,17 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 		ASSERT(IS_CACHELINE_ALIGNED(dest));
 
 		VALGRIND_ADD_TO_TX(dest, CACHELINE_SIZE);
+#ifndef PANGOLIN_LOGFREE
 		pmemops_memcpy(p_ops, dest, last_cacheline, CACHELINE_SIZE,
 			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+#endif
 		VALGRIND_REMOVE_FROM_TX(dest, CACHELINE_SIZE);
-#ifdef PANGOLIN_LOGREP
+#ifndef PANGOLIN_LOGFREE
+	#ifdef PANGOLIN_LOGREP
 		void *destrep = pangolin_repaddr(p_ops->base, dest);
 		pmemops_memcpy(p_ops, destrep, last_cacheline, CACHELINE_SIZE,
 			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+	#endif
 #endif
 	}
 
@@ -560,14 +567,18 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 	ASSERT(IS_CACHELINE_ALIGNED(e));
 
 	VALGRIND_ADD_TO_TX(e, CACHELINE_SIZE);
+#ifndef PANGOLIN_LOGFREE
 	pmemops_memcpy(p_ops, e, b, CACHELINE_SIZE,
 		PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+#endif
 	VALGRIND_REMOVE_FROM_TX(e, CACHELINE_SIZE);
 
+#ifndef PANGOLIN_LOGFREE
 #ifdef PANGOLIN_LOGREP
 	void *erep = pangolin_repaddr(p_ops->base, e);
 	pmemops_memcpy(p_ops, erep, b, CACHELINE_SIZE,
 		PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_MEM_NONTEMPORAL);
+#endif
 #endif
 
 #ifndef PANGOLIN
@@ -577,7 +588,10 @@ ulog_entry_buf_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 	 * log entries are copied to pmem. We call pmemops_drain() after
 	 * obuf_tx_log_commit().
 	 */
+#ifndef PANGOLIN_LOGFREE
+	// no log, no fence!
 	pmemops_drain(p_ops);
+#endif
 #endif
 
 	ASSERT(ulog_entry_valid(&e->base));
@@ -771,6 +785,7 @@ ulog_clobber_data(struct ulog *dest,
 	for (struct ulog *r = dest; r != NULL; ) {
 		size_t nzero = MIN(nbytes, rcapacity);
 		VALGRIND_ADD_TO_TX(r->data, nzero);
+#ifndef PANGOLIN_LOGFREE
 #ifdef PANGOLIN_LOGREP
 		void *datarep = pangolin_repaddr(p_ops->base, r->data);
 		pmemops_memset(p_ops, datarep, 0, nzero,
@@ -778,6 +793,7 @@ ulog_clobber_data(struct ulog *dest,
 			PMEMOBJ_F_MEM_NODRAIN | PMEMOBJ_F_RELAXED);
 #endif
 		pmemops_memset(p_ops, r->data, 0, nzero, PMEMOBJ_F_MEM_WC);
+#endif
 		VALGRIND_ADD_TO_TX(r->data, nzero);
 		nbytes -= nzero;
 

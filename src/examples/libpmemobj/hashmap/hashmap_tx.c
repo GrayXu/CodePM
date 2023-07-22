@@ -85,6 +85,9 @@ static void
 create_hashmap(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint32_t seed)
 {
 	size_t len = INIT_BUCKETS_NUM;
+	char *hashmap_size_char = getenv("PANGOLIN_HASHMAP_NUM");
+	if (hashmap_size_char)
+		len = strtol(hashmap_size_char, NULL, 0);  // 2x ops-per-thread will be good enough
 	size_t sz = sizeof(struct buckets) +
 			len * sizeof(TOID(struct entry));
 
@@ -100,11 +103,13 @@ create_hashmap(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint32_t seed)
 
 		struct buckets *bkts = pgl_tx_alloc_open_shared(sz,
 					TOID_TYPE_NUM(struct buckets));
+		if (bkts == NULL) exit(-6656);
 		hmap->buckets = (TOID(struct buckets))pgl_oid(bkts);
 		bkts->nbuckets = len;
 	} PGL_TX_ONABORT {
 		fprintf(stderr, "%s: transaction aborted\n", __func__);
 		abort();
+		exit(-6656);
 	} PGL_TX_END
 }
 
@@ -174,7 +179,9 @@ hm_tx_rebuild(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, size_t new_len)
  * - 0 if successful,
  * - 1 if value already existed,
  * - -1 if something bad happened
+ * warning: disable persistent count for less txn writes
  */
+#define DISABLE_HASHMAP_COUNT  // seems like not that useful
 int
 hm_tx_insert(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 	uint64_t key, PMEMoid value)
@@ -182,7 +189,7 @@ hm_tx_insert(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
 
 	TOID(struct buckets) buckets = hmap->buckets;
-	struct buckets *bkts = pgl_open_shared(buckets.oid);
+	struct buckets *bkts = pgl_open_shared(buckets.oid);  // shared mode is for performance
 
 	uint64_t h = hash(hmap, bkts, key);
 	int num = 0;
@@ -192,17 +199,20 @@ hm_tx_insert(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 
 	for (var = bkts->bucket[h]; !TOID_IS_NULL(var); var = pvar->next) {
 		pvar = pgl_get(var.oid);
-		if (pvar->key == key)
-			return 1;
-
-		num++;
+		// if (pvar->key == key)  // allow update (but in a dirty way)
+		// 	return 1;
+		num++;  // too long hash-link -> rebuild
 	}
 
 	int ret = 0;
+#ifndef DSIABLE_HASHMAP_COUNT
 	uint64_t count = hmap->count;
+#endif
 	size_t nbuckets = bkts->nbuckets;
-	PGL_TX_BEGIN(pop) {
+	PGL_TX_BEGIN(pop) {  // each write involve 2 updates
+#ifndef DSIABLE_HASHMAP_COUNT
 		hmap = pgl_tx_add(hmap);
+#endif
 		bkts = pgl_tx_add_range_shared(bkts,
 				offsetof(struct buckets, bucket[h]),
 				sizeof(PMEMoid));
@@ -213,9 +223,10 @@ hm_tx_insert(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 		e->value = value;
 		e->next = bkts->bucket[h];
 		bkts->bucket[h] = (TOID(struct entry))pgl_oid(e);
-
+#ifndef DISABLE_HASHMAP_COUNT
 		count += 1;
 		hmap->count = count;
+#endif
 		num++;
 	} PGL_TX_ONABORT {
 		fprintf(stderr, "transaction aborted\n");
@@ -225,8 +236,11 @@ hm_tx_insert(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap,
 	if (ret)
 		return ret;
 
-	if (num > MAX_HASHSET_THRESHOLD ||
-		(num > MIN_HASHSET_THRESHOLD && count > 2 * nbuckets))
+#ifndef DISABLE_HASHMAP_COUNT
+	if (num > MAX_HASHSET_THRESHOLD || (num > MIN_HASHSET_THRESHOLD && count > 2 * nbuckets))
+#else
+	if (num > MAX_HASHSET_THRESHOLD)
+#endif
 		hm_tx_rebuild(pop, hashmap, nbuckets * 2);
 
 	return 0;
@@ -355,7 +369,8 @@ hm_tx_get(PMEMobjpool *pop, TOID(struct hashmap_tx) hashmap, uint64_t key)
 	struct hashmap_tx *hmap = pgl_get(hashmap.oid);
 
 	TOID(struct buckets) buckets = hmap->buckets;
-	struct buckets *bkts = pgl_open_shared(buckets.oid);
+	// struct buckets *bkts = pgl_open_shared(buckets.oid);
+	struct buckets *bkts = pgl_get(buckets.oid);  // since no changes on bkts? don't need PGL protections
 
 	uint64_t h = hash(hmap, bkts, key);
 

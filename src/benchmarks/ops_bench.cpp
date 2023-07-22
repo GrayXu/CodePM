@@ -228,6 +228,9 @@ pgl_tx_alloc_op(PMEMobjpool *pop, void *data, PMEMoid *oids, size_t obj_id,
 	return 0;
 }
 
+#define ALIGN_256B(ptr) ((void *)(((uintptr_t)(ptr) + 255) & ~255))
+#define OBJ_ALIGN_OFFSET 192
+
 /*
  * pgl_tx_write_op -- pgl object commit
  */
@@ -241,12 +244,63 @@ pgl_tx_write_op(PMEMobjpool *pop, void *data, PMEMoid *oids, size_t obj_id,
 	PGL_TX_BEGIN(pop)
 	{
 		uint64_t *ptr = (uint64_t *)pgl_tx_open(oids[obj_id]);
-		pgl_tx_add_range(ptr, 0, obj_size);
+		
+		pgl_tx_add_range(ptr, 0, obj_size);  // it's a full obj update
+		// pgl_tx_add_range(ptr, OBJ_ALIGN_OFFSET, obj_size);
+	
+#ifdef PMEMBENCH_RANDOM
+		// ptr = (uint64_t *) ALIGN_256B(ptr)-16;  // force align
+		// ptr += OBJ_ALIGN_OFFSET/8;
+#endif	
+		// 8B write
+		// for (size_t i = 0; i < words; i++)
+		// 	ptr[i] = off + i;  // as random data
+		memset(ptr, (int) off, obj_size);
 
-		for (size_t i = 0; i < words; i++)
-			ptr[i] = off + i;
 	}
 	PGL_TX_END
+
+	return 0;
+}
+
+#ifndef RATIO
+#define RATIO 0.5
+#endif
+
+/* return 1 or 0 by given probability */
+int generateRandomValue(double probability) {
+    int randomNum = rand();
+    double normalizedRandom = (double)randomNum / RAND_MAX;
+    if (normalizedRandom < probability)  return 1;  // write
+	else return 0;  // read
+}
+
+/*
+ * pgl_tx_rw_op -- pgl object read and write commit
+ */
+static int
+pgl_tx_rw_op(PMEMobjpool *pop, void *data, PMEMoid *oids, size_t obj_id,
+		size_t obj_size)
+{
+	size_t words = obj_size >> 3; /* ignore trailing bytes */
+	uint64_t off = oids[obj_id].off;
+	uint64_t buf[words];
+	if (generateRandomValue(RATIO)) {  // write
+		PGL_TX_BEGIN(pop)
+		{
+			uint64_t *ptr = (uint64_t *)pgl_tx_open(oids[obj_id]);
+			pgl_tx_add_range(ptr, 0, obj_size);
+
+			// 8B write
+			// for (size_t i = 0; i < words; i++)
+			// 	ptr[i] = off + i;
+			memset(ptr, (int) off, obj_size);
+		}
+		PGL_TX_END
+	} else {  // read
+		void *ptr = pmemobj_direct(oids[obj_id]);
+		memcpy(buf, ptr, obj_size);
+	}
 
 	return 0;
 }
@@ -395,6 +449,7 @@ static struct op ops[] = {
 	{"pmemobj_tx_free", pmemobj_tx_free_op},
 	{"pgl_tx_alloc", pgl_tx_alloc_op},
 	{"pgl_tx_write", pgl_tx_write_op},
+	{"pgl_tx_rw", pgl_tx_rw_op},
 	{"pgl_tx_free", pgl_tx_free_op},
 	{"pangolin_repair_page", pangolin_repair_page_op},
 };
@@ -534,7 +589,10 @@ ops_bench_init_worker(struct benchmark *bench, struct benchmark_args *args,
 	/* do not allocate objects if the target operation is obj_alloc */
 	if (OPTYPE(pa, "pmemobj_tx_alloc") || OPTYPE(pa, "pgl_tx_alloc"))
 		goto done;
-
+	
+#ifdef PMEMBENCH_RANDOM
+	// size+=256;
+#endif
 	for (i = 0; i < nobjs; i++) {
 		PGL_TX_BEGIN(pb->pop)
 		{

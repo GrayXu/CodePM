@@ -118,6 +118,7 @@ struct map_bench {
 	TOID(struct map) map;
 
 	int (*insert)(struct map_bench *, uint64_t);
+	int (*update)(struct map_bench *, uint64_t);
 	int (*remove)(struct map_bench *, uint64_t);
 	int (*get)(struct map_bench *, uint64_t);
 };
@@ -257,6 +258,36 @@ map_insert_alloc_op(struct map_bench *map_bench, uint64_t key)
 	return ret;
 }
 
+/**
+ * map_insert_alloc_op with update supports
+*/
+static int
+map_insert_update_op(struct map_bench *map_bench, uint64_t key) {
+	PMEMoid val = OID_NULL;
+	int ret = 0;
+	val = map_get(map_bench->mapc, map_bench->map, key);
+	PGL_TX_BEGIN(map_bench->pop)
+	{
+		if (OID_IS_NULL(val)) {  // new one
+			PMEMoid oid = pgl_tx_alloc(map_bench->args->dsize, OBJ_TYPE_NUM);  // TODO: 16B offset
+			ret = map_insert(map_bench->mapc, map_bench->map, key, oid);
+		} else {
+			// val
+			uint64_t *ptr = (uint64_t *)pgl_tx_open(val);  // data ptr to shadow copy
+			pgl_tx_add_range(ptr, 0, map_bench->args->dsize);
+			memset(ptr, 1, map_bench->args->dsize);
+			ret = 0;
+		}
+	}
+	PGL_TX_ONABORT
+	{
+		ret = -1;
+	}
+	PGL_TX_END
+
+	return ret;
+}
+
 /*
  * map_insert_root_op -- insert root object to map
  */
@@ -277,11 +308,11 @@ map_insert_op(struct benchmark *bench, struct operation_info *info)
 	auto *tworker = (struct map_bench_worker *)info->worker->priv;
 	uint64_t key = tworker->keys[info->index];
 
-	mutex_lock_nofail(&map_bench->lock);
+	// mutex_lock_nofail(&map_bench->lock);
 
 	int ret = map_bench->insert(map_bench, key);
 
-	mutex_unlock_nofail(&map_bench->lock);
+	// mutex_unlock_nofail(&map_bench->lock);
 
 	return ret;
 }
@@ -411,7 +442,7 @@ map_insert_init_worker(struct benchmark *bench, struct benchmark_args *args,
 	assert(tworker);
 
 	for (size_t i = 0; i < tworker->nkeys; i++)
-		tworker->keys[i] = get_key(&targs->seed, targs->max_key);
+		tworker->keys[i] = get_key(&targs->seed, targs->max_key);  // gen random keys?
 
 	return 0;
 }
@@ -533,7 +564,11 @@ map_common_init(struct benchmark *bench, struct benchmark_args *args)
 	}
 
 	if (map_bench->margs->alloc) {
+#ifdef PMEMBENCH_MAP_UPDATE
+		map_bench->insert = map_insert_update_op;
+#else
 		map_bench->insert = map_insert_alloc_op;
+#endif
 		map_bench->remove = map_remove_free_op;
 		map_bench->get = map_get_obj_op;
 	} else {

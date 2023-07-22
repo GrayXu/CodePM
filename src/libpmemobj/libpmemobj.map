@@ -156,7 +156,9 @@ LIBPMEMOBJ_1.0 {
 		pangolin_atomic_xor;
 		pangolin_avx_xor;
 		pangolin_check_pool;
+		pangolin_scan;
 		pangolin_check_objs;
+		pangolin_check_obj_one;
 		pangolin_repair_page;
 	local:
 		*;

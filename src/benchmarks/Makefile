@@ -33,6 +33,7 @@
 #
 # src/benchmarks/Makefile -- build all benchmarks
 #
+
 TOP := $(dir $(lastword $(MAKEFILE_LIST)))../..
 
 include $(TOP)/src/common.inc
@@ -48,10 +49,11 @@ vpath %.c $(TOP)/src/rpmem_common
 vpath %.c $(TOP)/src/libpmempool
 
 BENCHMARK = pmembench
+YCSB = run_ycsb
 
 GLIB:= $(call check_package, glib-2.0)
 ifeq ($(GLIB),y)
-TARGET = $(BENCHMARK)
+TARGET = $(BENCHMARK) $(YCSB)
 else
 $(info NOTE: Skipping pmembench because glib-2.0 is missing \
 -- see src/benchmarks/README for details.)
@@ -107,21 +109,41 @@ endif
 LDFLAGS = -L$(LIBS_PATH) $(OS_LIBS)
 LDFLAGS += -L../examples/libpmemobj/map
 LDFLAGS += $(EXTRA_LDFLAGS)
-ifeq ($(DEBUG),)
-LIBS += ../nondebug/libpmemcommon.a
-LDFLAGS += -Wl,-rpath=../nondebug
-else
+
+##### DEBUG or NON-DEBUG #####
+
+ifeq ($(DEBUG),1)
+$(info "debug build")
 LIBS += ../debug/libpmemcommon.a
 LDFLAGS += -Wl,-rpath=../debug
+CXXFLAGS += -g -O0
+LIBS_PATH=../debug
+else
+ifeq ($(DEBUGX),1)
+$(info debugx)
+LIBS += ../nondebug/libpmemcommon.a
+LDFLAGS += -Wl,-rpath=../debug
+CXXFLAGS += -Og -DNDEBUG
+LIBS_PATH=../nondebug
+else
+$(info "nondebug build")
+LIBS += ../nondebug/libpmemcommon.a
+LDFLAGS += -Wl,-rpath=../nondebug
+CXXFLAGS += -O3 -DNDEBUG
+LIBS_PATH=../nondebug
 endif
+endif
+
+##### DEBUG or NON-DEBUG #####
+
 LIBS += -lpmemobj -lpmemlog -lpmemblk -lpmempool -lpmem -lvmem -pthread -lm -lnuma \
 	$(LIBDL) $(LIBUUID) $(LIBNDCTL)
 ifeq ($(LIBRT_NEEDED), y)
 LIBS += -lrt
 endif
 
-CXXFLAGS = -Wall
-CXXFLAGS += -Werror
+CXXFLAGS += -Wall
+# CXXFLAGS += -Werror
 CXXFLAGS += -std=c++11
 CXXFLAGS += -Wno-invalid-offsetof
 CXXFLAGS += -Wpointer-arith
@@ -170,12 +192,22 @@ LIBMAP=$(LIBMAP_DIR)/libmap.a
 
 OBJS += pmemobj.o
 
-ifeq ($(DEBUG),)
-CXXFLAGS += -O3
-LIBS_PATH=../nondebug
-else
-CXXFLAGS += -ggdb
-LIBS_PATH=../debug
+ifeq ($(PMEMBENCH_RANDOM),1)
+$(info random bench)
+CFLAGS += -DPMEMBENCH_RANDOM
+CXXFLAGS += -DPMEMBENCH_RANDOM
+endif
+
+ifeq ($(PMEMBENCH_MAP_UPDATE),1)
+$(info random bench)
+CFLAGS += -DPMEMBENCH_MAP_UPDATE
+CXXFLAGS += -DPMEMBENCH_MAP_UPDATE
+endif
+
+ifneq ($(RATIO),)
+CFLAGS += -DRATIO=$(RATIO)
+CXXFLAGS += -DRATIO=$(RATIO)
+$(info RW RATIO=$(RATIO))
 endif
 
 GLIB_TEST_PROG="\#include <glib.h>\nint main(){return 0;}"
@@ -206,11 +238,14 @@ objdir=.
 $(BENCHMARK): $(TMP_HEADERS) $(OBJS) $(LIBMAP)
 	$(CXX) -o $@ $(LDFLAGS) $(OBJS) $(LIBMAP) $(LIBS)
 
+$(YCSB): run_ycsb.o $(TMP_HEADERS) $(LIBMAP)
+	$(CXX) -o $@ $(LDFLAGS) run_ycsb.o $(LIBMAP) $(LIBS)
+
 $(LIBMAP):
 	$(MAKE) -C $(LIBMAP_DIR) map
 
 clean:
-	$(RM) $(OBJS) $(TMP_HEADERS)
+	$(RM) $(OBJS) $(TMP_HEADERS) run_ycsb.o
 	$(RM) *.csv
 
 clobber: clean

@@ -150,7 +150,7 @@ alloc_prep_block(struct palloc_heap *heap, const struct memory_block *m,
 		 */
 		if (!util_is_zeroed(REAL(uptr), OHDR_SIZE + usize)) {
 			pangolin_update_parity(heap->base, REAL(uptr), NULL,
-				OHDR_SIZE + usize);
+				OHDR_SIZE + usize);  // alloc here is like append
 		}
 	}
 #endif

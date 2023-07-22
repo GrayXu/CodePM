@@ -28,7 +28,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;;; Optimized xor of N source vectors using AVX512
-;;; int xor_gen_avx512(int vects, int len, void **array)
+;;; int xor_gen_avx512_pipeline_pgl(int vects, int len, void **array)
 
 ;;; Generates xor parity vector from N (vects-1) sources in array of pointers
 ;;; (**array).  Last pointer is the dest.
@@ -52,29 +52,6 @@
  %define FUNC_SAVE
  %define FUNC_RESTORE
 
-%elifidn __OUTPUT_FORMAT__, win64
- %define arg0  rcx
- %define arg1  rdx
- %define arg2  r8
- %define arg3  r9
- %define tmp   r11
- %define tmp3  r10
- %define func(x) proc_frame x
- %define return rax
- %define stack_size  2*16 + 8 	;must be an odd multiple of 8
-
- %macro FUNC_SAVE 0
-	alloc_stack	stack_size
-	vmovdqu	[rsp + 0*16], xmm6
-	vmovdqu	[rsp + 1*16], xmm7
-	end_prolog
- %endmacro
- %macro FUNC_RESTORE 0
-	vmovdqu	xmm6, [rsp + 0*16]
-	vmovdqu	xmm7, [rsp + 1*316]
-	add	rsp, stack_size
- %endmacro
-
 %endif	;output formats
 
 
@@ -86,16 +63,18 @@
 %define pos tmp3
 %define PS 8
 
-%define NO_NT_LDST
-;;; Use Non-temporal load/stor
-%ifdef NO_NT_LDST
- %define XLDR vmovdqu8
- %define XSTR vmovdqu8
-%else
- %define XLDR vmovntdqa
- %define XSTR vmovntdq
-%endif
+;;; %define NO_NT_LDST
+;;; ;;; Use Non-temporal load/stor
+;;; %ifdef NO_NT_LDST
+;;;  %define XLDR vmovdqu8
+;;;  %define XSTR vmovdqu8
+;;; %else
+;;;  %define XLDR vmovntdqa
+;;;  %define XSTR vmovntdq
+;;; %endif
 
+%define XLDR vmovdqu8
+%define XSTR vmovdqu8
 
 default rel
 [bits 64]
@@ -103,42 +82,44 @@ default rel
 section .text
 
 align 16
-global xor_gen_avx512:ISAL_SYM_TYPE_FUNCTION
-func(xor_gen_avx512)
+global xor_gen_avx512_pipeline_pgl:ISAL_SYM_TYPE_FUNCTION
+func(xor_gen_avx512_pipeline_pgl)
 	FUNC_SAVE
 	sub	vec, 2			;Keep as offset to last source
 	jng	return_fail		;Must have at least 2 sources
 	cmp	len, 0
 	je	return_pass
-	test	len, (128-1)		;Check alignment of length
+	test	len, (64-1)		;Check alignment of length
 	jnz	len_not_aligned
 
-len_aligned_128bytes:
-	sub	len, 128
+len_aligned_64bytes:
+	sub	len, 64
 	mov	pos, 0
 
-loop128:
+loop64:
 	mov	tmp, vec		;Back to last vector
 	mov	tmp2, [arg2+vec*PS]	;Fetch last pointer in array
 	sub	tmp, 1			;Next vect
 	XLDR	zmm0, [tmp2+pos]	;Start with end of array in last vector
-	XLDR	zmm1, [tmp2+pos+64]	;Keep xor parity in xmm0-7
+	;;;XLDR	zmm1, [tmp2+pos+64]	;Keep xor parity in xmm0-7
 
 next_vect:
 	mov 	ptr, [arg2+tmp*PS]
 	sub	tmp, 1
 	XLDR	zmm4, [ptr+pos]		;Get next vector (source)
-	XLDR	zmm5, [ptr+pos+64]
+	;;;XLDR	zmm5, [ptr+pos+64]
 	vpxorq	zmm0, zmm0, zmm4	;Add to xor parity
-	vpxorq	zmm1, zmm1, zmm5
+	;;;vpxorq	zmm1, zmm1, zmm5
 	jge	next_vect		;Loop for each source
 
 	mov	ptr, [arg2+PS+vec*PS]	;Address of parity vector
 	XSTR	[ptr+pos], zmm0		;Write parity xor vector
-	XSTR	[ptr+pos+64], zmm1
-	add	pos, 128
+	clwb	[ptr+pos]
+	;;;XSTR	[ptr+pos+64], zmm1
+	;;;clwb	[ptr+pos+64]
+	add	pos, 64
 	cmp	pos, len
-	jle	loop128
+	jle	loop64
 
 return_pass:
 	FUNC_RESTORE
@@ -168,8 +149,8 @@ nextvect_1byte:
 
 	cmp	len, 0
 	je	return_pass
-	test	len, (128-1)		;If not 0 and 128bit aligned
-	jz	len_aligned_128bytes	; then do aligned case. len = y * 128
+	test	len, (64-1)		;If not 0 and 64B aligned
+	jz	len_aligned_64bytes	; then do aligned case. len = y * 64
 
 	;; else we are 8-byte aligned so fall through to recheck
 
@@ -179,7 +160,7 @@ len_not_aligned:
 	test	len, (PS-1)
 	jne	loop_1byte
 	mov	tmp3, len
-	and	tmp3, (128-1)		;Do the unaligned bytes 8 at a time
+	and	tmp3, (64-1)		;Do the unaligned bytes 8 at a time
 
 	;; Run backwards 8 bytes at a time for (tmp3) bytes
 loop8_bytes:
@@ -201,8 +182,8 @@ nextvect_8bytes:
 	sub	tmp3, PS
 	jg	loop8_bytes
 
-	cmp	len, 128		;Now len is aligned to 128B
-	jge	len_aligned_128bytes	;We can do the rest aligned
+	cmp	len, 64		;Now len is aligned to 64B
+	jge	len_aligned_64bytes	;We can do the rest aligned
 
 	cmp	len, 0
 	je	return_pass

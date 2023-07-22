@@ -62,6 +62,13 @@ benchmark_time_diff(benchmark_time_t *d, benchmark_time_t *t1,
 	assert(nsecs >= 0);
 	d->tv_sec = nsecs / NSECPSEC;
 	d->tv_nsec = nsecs % NSECPSEC;
+	// if (nsecs >= 0) {
+	// 	d->tv_sec = nsecs / NSECPSEC;
+	// 	d->tv_nsec = nsecs % NSECPSEC;
+	// } else {
+	// 	d->tv_sec = 0;
+	// 	d->tv_nsec = 0;
+	// }
 }
 
 /*

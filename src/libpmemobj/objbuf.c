@@ -107,23 +107,26 @@ obuf_fill_objbuf(struct objbuf *obuf, void *pobj, size_t size, int copy_obj)
 	memcpy(REAL(uobj), REAL(pobj), size);
 
 #ifdef PANGOLIN_CHECKSUM
-	if (copy_obj) {
-		size_t user_size = USIZE(obuf->uobj);
-		uint32_t csum = pangolin_adler32(CSUM0, obuf->uobj, user_size);
-		if (obuf->csum != csum) {
-			uint64_t oidoff = OBJ_PTR_TO_OFF(ort->pop, pobj);
-			LOG_ERR("object checksum error - oid.off 0x%lx, "
-				"stored checksum 0x%x, computed checksum 0x%x",
-				oidoff, obuf->csum, csum);
-			if (!pangolin_repair_corruption(REAL(pobj), size,
-				0, obuf)) {
-				FATAL("cannot repair object corruption");
-			} else {
-				LOG_ERR("checksum error repaired at %p offset "
-					"0x%lx size %zu!", pobj, oidoff, size);
-			}
-		}
-	}
+	// temporary disable verification
+	// if (copy_obj) {
+	// 	size_t user_size = USIZE(obuf->uobj);
+	// 	uint32_t csum = pangolin_adler32(CSUM0, obuf->uobj, user_size);
+	// 	if (obuf->csum != csum) {
+	// 		uint64_t oidoff = OBJ_PTR_TO_OFF(ort->pop, pobj);
+	// 		LOG_ERR("object checksum error - oid.off 0x%lx, "
+	// 			"stored checksum 0x%x, computed checksum 0x%x",
+	// 			oidoff, obuf->csum, csum);
+
+	// 		// TODO: may fail here when logfree on skiplist and rtree
+	// 		if (!pangolin_repair_corruption(REAL(pobj), size,
+	// 			0, obuf)) {
+	// 			FATAL("cannot repair object corruption");
+	// 		} else {
+	// 			LOG_ERR("checksum error repaired at %p offset "
+	// 				"0x%lx size %zu!", pobj, oidoff, size);
+	// 		}
+	// 	}
+	// }
 #endif
 
 	return 0;
@@ -192,6 +195,64 @@ obuf_insert_shared(void *pobj, struct objbuf *obuf)
 	return obuf;
 }
 
+// TODO: actually can be simplified, because the indexing of delta does not need two-stage
+#define DELTAP_SIZE 1024*1024*1024ULL+1024*1024*512ULL
+static char* deltaP_buffer_e = NULL;  // ending addr for delta
+static char* deltaP_buffer_p = NULL;
+void
+init_deltaP_buffer()
+{
+	deltaP_buffer_p = Malloc(DELTAP_SIZE);
+	deltaP_buffer_e = deltaP_buffer_p + DELTAP_SIZE;
+}
+// malloc a addr pointer
+void *
+malloc_from_deltaP_buffer(size_t size)
+{
+	if (deltaP_buffer_p + size >= deltaP_buffer_e) {
+		deltaP_buffer_p = deltaP_buffer_e - DELTAP_SIZE;
+		printf("deltaP buffer overflow\n");  // pointer cannot be reused
+		exit(-6657);
+	}
+	void* ret = deltaP_buffer_p;
+	deltaP_buffer_p += size;
+	return ret;
+}
+///////////////////////////////////////////
+#define DELTA_BUFFER_SIZE 1024*1024*512ULL
+static char* delta_buffer_e = NULL;
+static char* delta_buffer_p = NULL;
+
+void
+init_delta_buffer()
+{
+	delta_buffer_p = Malloc(DELTA_BUFFER_SIZE);
+	delta_buffer_e = delta_buffer_p + DELTA_BUFFER_SIZE;
+}
+
+// void *
+// malloc_from_delta_buffer(size_t size)
+// {
+// 	if (delta_buffer_p + size >= delta_buffer_e) delta_buffer_p = delta_buffer_e;
+// 	void* ret = delta_buffer_p;
+// 	delta_buffer_p += size;
+// 	return ret;
+// }
+
+// reusing delta buffer
+void *
+malloc_aligned_from_delta_buffer(size_t size)
+{
+	if (delta_buffer_p + size >= delta_buffer_e) {
+		delta_buffer_p = delta_buffer_e - DELTA_BUFFER_SIZE;  // buffer usage is allower to re-use
+	}
+	size_t disp = CACHELINE_SIZE - (((uint64_t) delta_buffer_p) & CLMASK);
+	delta_buffer_p += disp;
+	void* ret = delta_buffer_p;
+	delta_buffer_p += size;
+	return ret;
+}
+
 /*
  * obuf_create_objbuf -- create an objbuf
  *
@@ -221,9 +282,12 @@ obuf_create_objbuf(PMEMobjpool *pop, void *pobj, struct obuf_pool *obp,
 #else
 	int inpool = obp && (obp->size + obuf_size <= OBUF_POOL_CAP);
 #endif
+	
+	inpool = obp && (obp->size + obuf_size <= OBUF_POOL_CAP);
+	
 	size_t disp = 0; /* displacement for cache-line alignment */
 
-	if (inpool) {
+	if (inpool) {  // use obufpool
 		obuf = (struct objbuf *)(obp->base + obp->size);
 		ASSERT(ALIGNED_CL(obuf));
 		obp->size += obuf_size;
@@ -257,6 +321,31 @@ obuf_create_objbuf(PMEMobjpool *pop, void *pobj, struct obuf_pool *obp,
 	/* clear objbuf content depending on oact */
 	size_t zeros = (oact & OBUF_ACT_CPYOBJ) ? OBUF_META_SIZE : obuf_size;
 	memset(obuf, 0, zeros);
+
+	// TODO: thread delta buffer alloc
+#ifdef PANGOLIN_PIPELINE_DATA
+	if (obuf->obj_delta == NULL) {
+		// assign them delta buffer (TODO: not thread-safe!!!)
+		// char *tmp = Malloc(data_size * 2 * sizeof(char));
+		// char *tmp = malloc_aligned_from_delta_buffer(data_size * 2 * sizeof(char));
+		// char *tmp = delta_buffer_p;  // fix delta buffer addr
+		obuf->obj_delta = delta_buffer_p;
+
+		// obuf->obj_delta = malloc_aligned_from_delta_buffer(sizeof(uint64_t *) * 2);
+		// obuf->obj_delta = malloc_from_deltaP_buffer(sizeof(uint64_t *) * 2);
+		// obuf->obj_delta[1] = (uint64_t *) (tmp + data_size);
+
+		// fix all addresses. avoid logical overflow, but may have worse locality? but save some pointers
+		// obuf->obj_delta = deltaP_buffer_p;
+		// obuf->obj_delta[0] = (uint64_t *) tmp;
+		// obuf->obj_delta[1] = (uint64_t *) (tmp + 1024*1024*1024ULL);
+
+		// fix buffer address, but ptr address will change. may have better locality? but save some pointers
+		// obuf->obj_delta = malloc_from_deltaP_buffer(sizeof(uint64_t *) * 2);
+		// obuf->obj_delta[0] = (uint64_t *) tmp;
+		// obuf->obj_delta[1] = (uint64_t *) (tmp + data_size);
+	}
+#endif
 
 	/*
 	 * data size to be copied from pmem
@@ -295,7 +384,13 @@ obuf_create_objbuf(PMEMobjpool *pop, void *pobj, struct obuf_pool *obp,
  */
 void
 obuf_free_objbuf(struct objbuf *obuf)
-{
+{	
+#ifdef PANGOLIN_PIPELINE_DATA
+	// free delta
+	// Free(obuf->obj_delta[0]);
+	// Free(obuf->obj_delta);
+#endif
+
 	if (OBUF_IS_INPOOL(obuf))
 		return;
 
@@ -623,7 +718,7 @@ obuf_get_runtime(void)
 }
 
 /*
- * obuf_create_runtime -- create objbuf runtime data structure
+ * obuf_create_runtime -- create objbuf runtime data structure **for Pangolin**
  */
 int
 obuf_create_runtime(PMEMobjpool *pop)
@@ -637,13 +732,14 @@ obuf_create_runtime(PMEMobjpool *pop)
 	COMPILE_ERROR_ON((SHARED_NSLOTS & SHARED_SLOT_MASK) != 0);
 
 	ASSERTeq(ort, NULL);
-
+	init_delta_buffer();
+	init_deltaP_buffer();
 	/*
 	 * PGL-TODO: This only supports a single pool or poolset. Need to
 	 * implement an array or hashmap for multiple pools, indexed by
 	 * pop->uuid_lo.
 	 */
-	ort = Zalloc(sizeof(struct obuf_runtime));
+	ort = Zalloc(sizeof(struct obuf_runtime));  // one obuf_runtime binds one PMEMobjpool *pop
 	ASSERTne(ort, NULL);
 
 	ort->pop = pop;
@@ -658,14 +754,17 @@ obuf_create_runtime(PMEMobjpool *pop)
 	ort->nzones = nzones;
 
 #ifdef PANGOLIN_PARITY
-	/* one chunk array will be parity */
+	/* one chunk array will be parity (default: 9+1) */
 	uint32_t zone_rows = 10;
 	uint32_t last_zone_rows = 10;
+	uint32_t parity_rows = 1;
 
-	char *env_zone_rows = os_getenv("PANGOLIN_ZONE_ROWS");
+	char *env_zone_rows = os_getenv("PANGOLIN_ZONE_ROWS");  // the num of rows in one zone
+	char *env_zone_parity = os_getenv("PANGOLIN_ZONE_ROWS_PARITY");  // the num of parity rows in one zone
+	
 	if (env_zone_rows) {
 		int64_t rows = strtol(env_zone_rows, NULL, 0);
-		if (rows < 10 || rows > 100) {
+		if (rows < 4 || rows > 1000) {
 			Free(ort);
 			FATAL("invalid PANGOLIN_ZONE_ROWS %ld!", rows);
 		}
@@ -673,20 +772,34 @@ obuf_create_runtime(PMEMobjpool *pop)
 		zone_rows = (uint32_t)rows;
 		last_zone_rows = (uint32_t)rows;
 	}
+	if (env_zone_parity) {
+		int64_t rows = strtol(env_zone_parity, NULL, 0);
+		if (rows < 1 || rows > 2) {  // TODO: only support p=1,2
+			Free(ort);
+			FATAL("invalid PANGOLIN_ZONE_ROWS_PARITY %ld!", rows);
+		}
+		parity_rows = (uint32_t)rows;
+	}
+	init_ec_runtime(zone_rows-parity_rows, parity_rows, 4096);  // init isa-l ec
 
 	/* first compute parameters for a max-sized zone */
 	uint64_t zone_chunks = MAX_CHUNK;
 	/* #chunks of an chunk array, remainder is wasted */
 	uint64_t zone_row_chunks = zone_chunks / zone_rows;
 	/* #bytes of an chunk array */
-	uint64_t zone_row_size = zone_row_chunks * CHUNKSIZE;
-	/* parity offset into the zone */
-	uint64_t zone_parity = sizeof(struct zone) +
-		(zone_rows - 1) * zone_row_size;
-
+	uint64_t zone_row_size = zone_row_chunks * CHUNKSIZE;  // track by offset directly
 	ort->zone_rows = zone_rows;
+	ort->zone_rows_parity = parity_rows;
 	ort->zone_row_size = zone_row_size;
-	ort->zone_parity = zone_parity;
+
+	/* parity offset into the zone */
+	if (parity_rows == 1) {  // only 1 xor parity
+		ort->zone_parity = sizeof(struct zone) + (zone_rows - 1) * zone_row_size;
+		ort->zone_parity_1 = 0;
+	} else {  // 2 parity RS code
+		ort->zone_parity = sizeof(struct zone) + (zone_rows - 2) * zone_row_size;
+		ort->zone_parity_1 = sizeof(struct zone) + (zone_rows - 1) * zone_row_size;
+	}
 
 	/* initialize zone's range-column locks */
 #ifdef PANGOLIN_RCLOCKHLE
@@ -708,14 +821,22 @@ obuf_create_runtime(PMEMobjpool *pop)
 	}
 
 	zone_chunks = (zone_size - sizeof(struct zone)) / CHUNKSIZE;
-	zone_row_chunks = zone_chunks / last_zone_rows;
+	zone_row_chunks = zone_chunks / last_zone_rows;  // the last row is shorter, but coding param unchanged
 	zone_row_size = zone_row_chunks * CHUNKSIZE;
-	zone_parity = sizeof(struct zone) + (zone_rows - 1) * zone_row_size;
 
 	ort->last_zone_id = nzones - 1;
 	ort->last_zone_rows = last_zone_rows;
+	ort->last_zone_rows_parity = parity_rows;
 	ort->last_zone_row_size = zone_row_size;
-	ort->last_zone_parity = zone_parity;
+
+	// parity addr in the last zone (same as normal filled zone)
+	if (parity_rows == 1) {
+		ort->last_zone_parity = sizeof(struct zone) + (last_zone_rows - 1) * ort->last_zone_row_size;
+		ort->last_zone_parity_1 = 0;
+	} else {
+		ort->last_zone_parity = sizeof(struct zone) + (last_zone_rows - 2) * ort->last_zone_row_size;
+		ort->last_zone_parity_1 = sizeof(struct zone) + (last_zone_rows - 1) * ort->last_zone_row_size;
+	}
 
 	zone_rclocks = zone_row_chunks * (CHUNKSIZE / RCLOCKSIZE);
 	ort->zone_rclock[zid] = Zalloc(zone_rclocks * sizeof(os_rwlock_t));
@@ -725,7 +846,15 @@ obuf_create_runtime(PMEMobjpool *pop)
 		os_rwlock_init(&ort->zone_rclock[zid][rclock]);
 #endif
 
-	ort->rclock_threshold = 512;
+
+	// ort->rclock_threshold = 512;  // a trade off by pangolin default (8KB in paper)
+#ifdef PANGOLIN_FORCE_ATOMIC_XOR
+	ort->rclock_threshold = 8192;  // a super big threshold to force atomic xor
+#else
+	ort->rclock_threshold = 16;  // a super small threshold to force SIMD xor
+#endif
+
+	
 	char *env_rclock_threshold = os_getenv("PANGOLIN_RCLOCK_THRESHOLD");
 	if (env_rclock_threshold) {
 		size_t rcth = strtoul(env_rclock_threshold, NULL, 0);

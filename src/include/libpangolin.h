@@ -33,10 +33,10 @@
 /*
  * libpangolin.c -- libpangolin APIs
  */
-
 #ifndef LIBPANGOLIN_H
 #define LIBPANGOLIN_H 1
 
+// #include "pangolin_ec.h"
 #include "libpmemobj.h"
 
 #ifdef __cplusplus
@@ -232,7 +232,13 @@ int
 pangolin_check_pool(PMEMobjpool *pop, int repair);
 
 int
+pangolin_scan(PMEMobjpool *pop, int repair, size_t num_thread, size_t num_parity);
+
+int
 pangolin_check_objs(PMEMobjpool *pop, int repair);
+
+int
+pangolin_check_obj_one(uint64_t *pobj);
 
 #ifdef __cplusplus
 }

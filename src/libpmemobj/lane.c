@@ -198,7 +198,6 @@ lane_ulog_constructor(void *base, void *ptr, size_t usable_size, void *arg)
 #else
 	ulog_construct(OBJ_PTR_TO_OFF(base, ptr), capacity, 1, 1, p_ops);
 #endif
-
 	return 0;
 }
 
@@ -211,9 +210,8 @@ lane_undo_extend(void *base, uint64_t *redo)
 	PMEMobjpool *pop = base;
 	struct tx_parameters *params = pop->tx_params;
 	size_t s = SIZEOF_ALIGNED_ULOG(params->cache_size);
-
 #ifdef PANGOLIN_LOGREP
-	s += s; /* double the allocation size */
+		s += s; /* double the allocation size */
 #endif
 
 #ifndef PANGOLIN_PARITY
@@ -238,7 +236,7 @@ lane_redo_extend(void *base, uint64_t *redo)
 
 	s += s; /* double the allocation size */
 #else
-	size_t s = SIZEOF_ALIGNED_ULOG(LANE_REDO_EXTERNAL_SIZE);
+	size_t s = SIZEOF_ALIGNED_ULOG(LANE_REDO_EXTERNAL_SIZE);  // only one redo log
 #endif
 
 #ifndef PANGOLIN_PARITY

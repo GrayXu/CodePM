@@ -91,10 +91,14 @@ _arg_gdb="off"
 _arg_report="off"
 _arg_append="off"
 
+# coding param by default
+_arg_zone_rows="10"
+_arg_zone_rows_parity="1"
+
 print_help ()
 {
     printf '%s\n' "Run a benchmark and report results"
-    printf 'Usage: %s [-t|--ntth <arg>] [-m|--message <arg>] [--(no-)pmem] [--(no-)clflushopt] [--(no-)clwb] [--(no-)movnt] [--(no-)avx] [--(no-)avx512f] [-i|--interleave <arg>] [-N|--cpunodebind <arg>] [-d|--(no-)gdb] [-r|--(no-)report] [-a|--(no-)append] [-h|--help] <cfg>\n' "$0"
+    printf 'Usage: %s [-t|--ntth <arg>] [-m|--message <arg>] [--(no-)pmem] [--(no-)clflushopt] [--(no-)clwb] [--(no-)movnt] [--(no-)avx] [--(no-)avx512f] [-i|--interleave <arg>] [-N|--cpunodebind <arg>] [--zone-rows <arg>] [--zone-rows-parity <arg>] [-d|--(no-)gdb] [-r|--(no-)report] [-a|--(no-)append] [-h|--help] <cfg>\n' "$0"
     printf '\t%s\n' "<cfg>: benchmark configuration file (*.cfg)"
     printf '\t%s\n' "-t,--ntth: threshold for movnt-based memcpy (default: '256')"
     printf '\t%s\n' "-m,--message: note message for this run (no default)"
@@ -106,6 +110,8 @@ print_help ()
     printf '\t%s\n' "--avx512f,--no-avx512f: use avx512f for non-temporal memcpy to pmem (off by default)"
     printf '\t%s\n' "-i,--interleave: set a memory interleave policy; same argument for numactl (default: 'all')"
     printf '\t%s\n' "-N,--cpunodebind: only execute command on the CPUs of nodes; same argument for numactl (default: '0')"
+    printf '\t%s\n' "--zone-rows: the number of rows (default: '10', only support 10~100)"
+    printf '\t%s\n' "--zone-rows-parity: the number of parity rows (default '1', only support 1~2)"
     printf '\t%s\n' "-d,--gdb,--no-gdb: run the benchmark with gdb (off by default)"
     printf '\t%s\n' "-r,--report,--no-report: report results of interest (off by default)"
     printf '\t%s\n' "-a,--append,--no-append: append report to <bench>.rpt (off by default)"
@@ -186,6 +192,12 @@ parse_commandline ()
             -N*)
                 _arg_cpunodebind="${_key##-N}"
                 ;;
+            --zone-rows=*)
+                _arg_zone_rows="${_key##--zone-rows=}"
+                ;;
+            --zone-rows-parity=*)
+                _arg_zone_rows_parity="${_key##--zone-rows-parity=}"
+                ;;
             -d|--no-gdb|--gdb)
                 _arg_gdb="on"
                 test "${1:0:5}" = "--no-" && _arg_gdb="off"
@@ -265,21 +277,25 @@ assign_positional_args
 
 cpunodebind=$_arg_cpunodebind
 interleave=$_arg_interleave
-numacmd="numactl --interleave=$interleave --cpunodebind $cpunodebind"
+# numacmd="numactl --interleave=$interleave --cpunodebind $cpunodebind"
+numacmd="numactl --cpubind=$cpunodebind --membind=$cpunodebind"
 
 print_pmdk_env ()
 {
     echo
-    echo "PMEM_IS_PMEM_FORCE   = $PMEM_IS_PMEM_FORCE"
-    echo "PMEM_NO_CLFLUSHOPT   = $PMEM_NO_CLFLUSHOPT"
-    echo "PMEM_NO_CLWB         = $PMEM_NO_CLWB"
-    echo "PMEM_NO_MOVNT        = $PMEM_NO_MOVNT"
-    echo "PMEM_AVX             = $PMEM_AVX"
-    echo "PMEM_AVX512F         = $PMEM_AVX512F"
-    echo "PMEM_MOVNT_THRESHOLD = $PMEM_MOVNT_THRESHOLD"
+    echo "PMEM_IS_PMEM_FORCE        = $PMEM_IS_PMEM_FORCE"
+    echo "PMEM_NO_CLFLUSHOPT        = $PMEM_NO_CLFLUSHOPT"
+    echo "PMEM_NO_CLWB              = $PMEM_NO_CLWB"
+    echo "PMEM_NO_MOVNT             = $PMEM_NO_MOVNT"
+    echo "PMEM_AVX                  = $PMEM_AVX"
+    echo "PMEM_AVX512F              = $PMEM_AVX512F"
+    echo "PMEM_MOVNT_THRESHOLD      = $PMEM_MOVNT_THRESHOLD"
+
+    echo "PANGOLIN_ZONE_ROWS        = $PANGOLIN_ZONE_ROWS"
+    echo "PANGOLIN_ZONE_ROWS_PARITY = $PANGOLIN_ZONE_ROWS_PARITY"
     echo
-    echo "NUMA CPU Node        = $cpunodebind"
-    echo "NUMA Interleave      = $interleave"
+    echo "NUMA CPU Node             = $cpunodebind"
+    echo "NUMA Interleave           = $interleave"
     echo
 }
 
@@ -296,9 +312,11 @@ export PMEM_AVX=$(expr "$_arg_avx" == "on")
 export PMEM_AVX512F=$(expr "$_arg_avx512f" == "on")
 export PMEM_MOVNT_THRESHOLD=$_arg_ntth
 
-# export PANGOLIN_ZERO_HEAP=1
+export PANGOLIN_ZONE_ROWS=$_arg_zone_rows
+export PANGOLIN_ZONE_ROWS_PARITY=$_arg_zone_rows_parity
 
-# export PANGOLIN_ZONE_ROWS=100
+# export PANGOLIN_ZERO_HEAP=1  # init heap with zero
+
 # export PANGOLIN_RCLOCK_THRESHOLD=8192
 
 # export PANGOLIN_GET_VERIFY_CSUM=1
@@ -327,25 +345,28 @@ echo
 if   [ "$_arg_gdb" == "on" ]; then
     gdb --args ./pmembench $_arg_cfg
 elif [ "$_arg_report" == "off" ]; then
-    ./pmembench $_arg_cfg
+    echo "sudo PMEM_AVX512F=$(expr "$_arg_avx512f" == "on") PANGOLIN_ZONE_ROWS=$_arg_zone_rows PANGOLIN_ZONE_ROWS_PARITY=$_arg_zone_rows_parity $numacmd ./pmembench $_arg_cfg"
+    sudo TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD=1000000000000 PMEM_AVX512F=$(expr "$_arg_avx512f" == "on") PANGOLIN_ZONE_ROWS=$_arg_zone_rows PANGOLIN_ZONE_ROWS_PARITY=$_arg_zone_rows_parity $numacmd ./pmembench $_arg_cfg
 else
-    csvfile=$bench.csv
+    csvfile=bench_results/$bench.csv
     echo "runbench result file" > $csvfile
     echo "#build: $build" >> $csvfile
     # Use stdbuf to minimize pipe buffering.
     # stdbuf -oL -eL ./pmembench $_arg_cfg 2>&1 | tee -a $csvfile
-    $numacmd ./pmembench $_arg_cfg 2>&1 | tee -a $csvfile
+    echo "sudo PMEM_AVX512F=$(expr "$_arg_avx512f" == "on") PANGOLIN_ZONE_ROWS=$_arg_zone_rows PANGOLIN_ZONE_ROWS_PARITY=$_arg_zone_rows_parity $numacmd ./pmembench $_arg_cfg 2>&1 | tee -a $csvfile"
+    sudo TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD=1000000000000 PMEM_AVX512F=$(expr "$_arg_avx512f" == "on") PANGOLIN_ZONE_ROWS=$_arg_zone_rows PANGOLIN_ZONE_ROWS_PARITY=$_arg_zone_rows_parity $numacmd ./pmembench $_arg_cfg 2>&1 | tee -a $csvfile
 fi
 
-if [ "$_arg_report" == "on" ]; then
-    if [ "$_arg_append" == "off" ]; then
-        echo; ./benchreport $csvfile
-    else
-        rptfile=$bench.rpt
-        (printf '=%.0s' {1..130}; echo) >> $rptfile
-        echo -n "$(date) - [$build]" >> $rptfile
-        test -n "$_arg_message" && echo -n " - $_arg_message" >> $rptfile
-        (echo; print_pmdk_env) >> $rptfile
-        ./benchreport $csvfile 2>&1 | tee -a $rptfile
-    fi
-fi
+# gen html
+# if [ "$_arg_report" == "on" ]; then
+#     if [ "$_arg_append" == "off" ]; then
+#         echo; ./benchreport $csvfile
+#     else
+#         rptfile=bench_results/$bench.rpt
+#         (printf '=%.0s' {1..130}; echo) >> $rptfile
+#         echo -n "$(date) - [$build]" >> $rptfile
+#         test -n "$_arg_message" && echo -n " - $_arg_message" >> $rptfile
+#         (echo; print_pmdk_env) >> $rptfile
+#         ./benchreport $csvfile 2>&1 | tee -a $rptfile
+#     fi
+# fi

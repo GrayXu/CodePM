@@ -248,7 +248,7 @@ struct benchmark_clo {
  * worker_info - Worker thread's information structure.
  */
 struct worker_info {
-	size_t index;		       /* index of worker thread */
+	size_t index;		       /* index of worker thread (as thread_id) */
 	struct operation_info *opinfo; /* operation info structure */
 	size_t nops;		       /* number of operations */
 	void *priv;		       /* worker's private data */
@@ -327,6 +327,7 @@ struct benchmark_info {
 			    struct benchmark_args *args,
 			    struct worker_info *worker);
 	int (*operation)(struct benchmark *bench, struct operation_info *info);
+	int (*operation2)(struct benchmark *bench, struct operation_info *info);
 	void (*print_extra_headers)();
 	void (*print_extra_values)(struct benchmark *bench,
 				   struct benchmark_args *args,

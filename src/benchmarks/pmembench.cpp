@@ -48,6 +48,8 @@
 #include <sched.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <algorithm>
+#include <iostream>
 
 #include "benchmark.hpp"
 #include "benchmark_worker.hpp"
@@ -389,6 +391,71 @@ pmembench_merge_clos(struct benchmark *bench)
 	bench->args_size = size;
 }
 
+#ifdef PMEMBENCH_RANDOM
+/*
+ * random
+ */
+void randomPlacement(size_t len, size_t arr[]) {
+    std::srand(static_cast<unsigned int>(std::time(nullptr)));
+    for (size_t i = 0; i < len; ++i) arr[i] = i;
+    for (size_t i = 0; i < len; ++i) {
+        size_t j = std::rand() % len;
+        std::swap(arr[i], arr[j]);
+    }
+}
+#endif
+
+#ifdef OUTPUT_PM_WRITES
+#define NUM_CHANNELS 12
+unsigned long convertHexString(const char *input) {
+    const char *separator = "=";
+    char *token;
+    
+    char *inputCopy = strdup(input);
+    if (!inputCopy) return 0;
+
+    token = strtok(inputCopy, separator);
+    if (token != NULL) {
+        token = strtok(NULL, separator);
+        if (token != NULL) {
+            char *end;
+            for (end = token + strlen(token) - 1; end >= token && (*end == ' ' || *end == '\n'); --end) 
+                *end = '\0';
+            
+            unsigned long number = (unsigned long)strtol(token, NULL, 16);
+            free(inputCopy);
+            return number;
+        }
+    }
+    free(inputCopy);
+    return 0;
+}
+/**
+ * @return an array of 12 unsigned longs, each representing a channel
+*/
+unsigned long * get_media_writes() {
+    unsigned long *ret = (unsigned long *)malloc(NUM_CHANNELS * sizeof(unsigned long));
+    FILE *fp;
+    char content[2000];
+
+    fp = popen("ipmctl show -performance | grep TotalMediaWrites", "r");
+    if (fp == NULL) {
+        printf("Failed to run ipmctl\n");
+        exit(1);
+    }
+    int index = 0;
+    while (fgets(content, sizeof(content), fp) != NULL) {
+        printf("%s", content);
+        unsigned long number = convertHexString(content);
+        ret[index] = number;
+        // printf("%lu\n", number);
+        index++;
+    }
+    pclose(fp);
+    return ret;
+}
+#endif
+
 /*
  * pmembench_run_worker -- run worker with benchmark operation
  */
@@ -406,13 +473,60 @@ pmembench_run_worker(struct benchmark *bench, struct worker_info *winfo)
 	 * factor from Tget estimation, and adjust the average latency
 	 * calculation in get_total_results().
 	 */
-	benchmark_time_get(&winfo->beg);
+	
+#ifdef PMEMBENCH_RANDOM
+	// gen random index
+	size_t* index_random = (size_t*) malloc(sizeof(size_t) * winfo->nops);
+	randomPlacement(winfo->nops, index_random);
+#endif
+
+#ifdef PMEMBENCH_MAP_UPDATE
+// INSERT FIRST and then do update
 	for (size_t i = 0; i < winfo->nops; i++) {
 		if (bench->info->operation(bench, &winfo->opinfo[i]))
 			return -1;
+	}
+#endif
+
+#ifdef OUTPUT_PM_WRITES
+	unsigned long * writes = get_media_writes();
+	printf("before:\t");
+	for (int i = 0; i < NUM_CHANNELS - 1; i++) {
+		printf("%lu, ", writes[i]);
+	}
+	printf("\n")
+#endif
+
+	benchmark_time_get(&winfo->beg);
+
+	for (size_t i = 0; i < winfo->nops; i++) {
+#ifdef PMEMBENCH_RANDOM
+		winfo->opinfo[i].index = index_random[winfo->opinfo[i].index];  // make index random
+#endif
+		if (bench->info->operation(bench, &winfo->opinfo[i])) return -1;
 		benchmark_time_get(&winfo->opinfo[i].end);
 	}
+	// benchmark_time_get(&winfo->opinfo[winfo->nops-1].end);
+
 	benchmark_time_get(&winfo->end);
+
+#ifdef PMEMBENCH_RANDOM
+	free(index_random);
+#endif
+
+#ifdef OUTPUT_PM_WRITES
+	unsigned long * writes_post = get_media_writes();
+	printf("after:\t");
+	for (int i = 0; i < NUM_CHANNELS - 1; i++) {
+		printf("%lu, ", writes_post[i]);
+	}
+	printf("\n")
+	printf("diff:\t");
+	for (int i = 0; i < NUM_CHANNELS - 1; i++) {
+		printf("%lu, ", writes_post[i]-writes[i]);
+	}
+	printf("\n")
+#endif
 
 	return 0;
 }

@@ -26,3 +26,17 @@ nbproject/
 *.hpptmp
 *.aps
 tags
+cscope.in.out
+cscope.out
+cscope.po.out
+*.pyc
+*.html
+src/benchmarks/run_ycsb
+src/benchmarks/workloads
+src/benchmarks/log
+src/benchmarks/perf.data
+src/benchmarks/perf.data.old
+src/benchmarks/perf.script
+src/benchmarks/workrun.floded
+
+.vscode/*

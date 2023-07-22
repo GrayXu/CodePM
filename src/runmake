@@ -51,6 +51,20 @@
 # ARGBASH_SET_INDENT([    ])
 # ARGBASH_GO
 
+# auto make clean
+build_param=$(cat .build_param)
+
+if [ "$build_param" = "$*" ]; then
+    echo -e "\033[0;32mNo need to clean\033[0m"
+else
+    echo -e "\033[0;32mClean all\033[0m"
+    # cd libpmemobj  # only clean libpmemobj
+    echo "clean"
+    make clean -j &> /dev/null
+    # cd ..
+    echo $@ > .build_param
+fi
+
 die()
 {
     local _ret=$2
@@ -81,6 +95,14 @@ _arg_parity="off"
 _arg_checksum="off"
 _arg_rclockhle="off"
 
+_arg_logfree="off"
+_arg_logfree_nofence="off"
+_arg_pipeline="off"
+_arg_pipeline_data="off"
+_arg_pipeline_data_2m="off"
+_arg_force_atomic_xor="off"
+_arg_avx512code="off"
+
 print_help ()
 {
     printf '%s\n' "Build PMDK with different configurations"
@@ -94,6 +116,13 @@ print_help ()
     printf '\t%s\n' "-p,--parity,--no-parity: enable zone parity for object data redundancy (off by default)"
     printf '\t%s\n' "-c,--checksum,--no-checksum: enable pool's metadata and per-object checksums (off by default)"
     printf '\t%s\n' "-e,--rclockhle,--no-rclockhle: enable hardware lock elision for range column locks (off by default)"
+    printf '\t%s\n' "--logfree: log-free (off by default)"
+    printf '\t%s\n' "--logfree-nofence: logfree and no inside fence  (off by default)"
+    printf '\t%s\n' "--pipeline: early flush in the pipeline strategy (off by default)"
+    printf '\t%s\n' "--pipeline_data: lazy fence after delta data in the pipeline strategy (off by default)"
+    printf '\t%s\n' "--pipeline_data_2m: lazy fence after delta parity in the pipeline strategy (off by default)"
+    printf '\t%s\n' "--avx512code: partially avx512 coding  (off by default)"
+    printf '\t%s\n' "--force_atomic_xor: force atomic 8B xor (off by default)"
     printf '\t%s\n' "-h,--help: Prints help"
 }
 
@@ -186,6 +215,38 @@ parse_commandline ()
                 print_help
                 exit 0
                 ;;
+            --logfree)
+                _arg_logfree="on"
+                echo "Coded-PM: LOGFREE!"
+                ;;
+            --logfree-nofence)
+                _arg_logfree_nofence="on"
+                echo "Coded-PM: LOGFREE_NOFENCE"
+                ;;
+            --pipeline)
+                _arg_pipeline="on"
+                echo "Coded-PM: PIPELINE!"
+                ;;
+            --pipeline_data)
+                _arg_pipeline_data="on"
+                echo "Coded-PM: PIPELINE_DATA!"
+                ;;
+            --pipeline_data_2m)
+                _arg_pipeline_data_2m="on"
+                echo "Coded-PM: PIPELINE_DATA_2M!"
+                ;;
+            --parity_nolock)
+                _arg_parity_nolock="on"
+                echo "Coded-PM: PARITY_NOLOCK!"
+                ;;
+            --avx512code)
+                _arg_avx512code="on"
+                echo "Coded-PM: AVX512CODE!"
+                ;;
+            --force_atomic_xor)
+                _arg_force_atomic_xor="on"
+                echo "Coded-PM: force atomic XOR!"
+                ;;
             -h*)
                 print_help
                 exit 0
@@ -223,19 +284,27 @@ assign_positional_args
 
 print_make_env ()
 {
-    echo "CC                 = $CC"
-    echo "CXX                = $CXX"
+    echo "CC                        = $CC"
+    echo "CXX                       = $CXX"
     echo
-    echo "PROBE              = $PROBE"
+    echo "PROBE                     = $PROBE"
     echo
-    echo "PANGOLIN           = $PANGOLIN"
-    echo "PANGOLIN_METAREP   = $PANGOLIN_METAREP"
-    echo "PANGOLIN_LOGREP    = $PANGOLIN_LOGREP"
-    echo "PANGOLIN_PARITY    = $PANGOLIN_PARITY"
-    echo "PANGOLIN_CHECKSUM  = $PANGOLIN_CHECKSUM"
-    echo "PANGOLIN_RCLOCKHLE = $PANGOLIN_RCLOCKHLE"
+    echo "PANGOLIN                  = $PANGOLIN"
+    echo "PANGOLIN_METAREP          = $PANGOLIN_METAREP"
+    echo "PANGOLIN_LOGREP           = $PANGOLIN_LOGREP"
+    echo "PANGOLIN_PARITY           = $PANGOLIN_PARITY"
+    echo "PANGOLIN_CHECKSUM         = $PANGOLIN_CHECKSUM"
+    echo "PANGOLIN_RCLOCKHLE        = $PANGOLIN_RCLOCKHLE"
+    echo "PANGOLIN_LOGFREE          = $PANGOLIN_LOGFREE"
+    echo "PANGOLIN_PIPELINE         = $PANGOLIN_PIPELINE"
+    echo "PANGOLIN_PIPELINE_DATA    = $PANGOLIN_PIPELINE_DATA"
+    echo "PANGOLIN_PIPELINE_DATA_2M = $PANGOLIN_PIPELINE_DATA_2M"
+    echo "PANGOLIN_PARITY_NOLOCK    = $PANGOLIN_PARITY_NOLOCK"
+    echo "PANGOLIN_AVX512CODE       = $PANGOLIN_AVX512CODE"
+    echo "PANGOLIN_LOGFREE_NOFENCE  = $PANGOLIN_LOGFREE_NOFENCE"
+    echo "PANGOLIN_FORCE_ATOMIC_XOR = $PANGOLIN_FORCE_ATOMIC_XOR"
     echo
-    echo "Make Target        = $_arg_target"
+    echo "Make Target          = $_arg_target"
 }
 
 test "$_arg_clang" == "on" && export CC=clang CXX=clang++
@@ -244,12 +313,25 @@ test "$_arg_probe" == "on" && export PROBE=1
 
 # this branch uses #ifdef PANGOLIN to highlight added/modified code
 export PANGOLIN=1
+# export PANGOLIN_LOGFREE=1
+# export PANGOLIN_PIPELINE=1
+# export PANGOLIN_AVX512CODE=1
+
 # export SANITIZE=address # for using address sanitizer
 test "$_arg_logrep" == "on" && export PANGOLIN_LOGREP=1
 test "$_arg_metarep" == "on" && export PANGOLIN_METAREP=1
 test "$_arg_parity" == "on" && export PANGOLIN_PARITY=1
 test "$_arg_checksum" == "on" && export PANGOLIN_CHECKSUM=1
 test "$_arg_rclockhle" == "on" && export PANGOLIN_RCLOCKHLE=1
+test "$_arg_logfree" == "on" && export PANGOLIN_LOGFREE=1
+test "$_arg_logfree_nofence" == "on" && export PANGOLIN_LOGFREE_NOFENCE=1
+test "$_arg_pipeline" == "on" && export PANGOLIN_PIPELINE=1
+test "$_arg_pipeline_data" == "on" && export PANGOLIN_PIPELINE_DATA=1
+test "$_arg_pipeline_data_2m" == "on" && export PANGOLIN_PIPELINE_DATA_2M=1
+test "$_arg_parity_nolock" == "on" && export PANGOLIN_PARITY_NOLOCK=1
+test "$_arg_avx512code" == "on" && export PANGOLIN_AVX512CODE=1
+test "$_arg_force_atomic_xor" == "on" && export PANGOLIN_FORCE_ATOMIC_XOR=1
+
 
 # sanity-check make target
 case $_arg_target in
@@ -274,8 +356,10 @@ cpus=$(getconf _NPROCESSORS_ONLN)
 
 if [ $_arg_target == "default" ]; then
     cscope -Rbq
-    make -C libpmemobj isa_l # hack solution; better add it to Makefile
-    make -j$cpus
+    make EXTRA_CFLAGS="-Wno-error=unused-function -Wno-error=unused-variable" -C libpmemobj isa_l # hack solution; better add it to Makefile
+    pwd
+    make EXTRA_CFLAGS="-Wno-error=unused-function -Wno-error=unused-variable" -j$cpus
+    # make
 elif [ $_arg_target == "clobber" ]; then
     make -C libpmemobj isa_l_clean
     make -j$cpus clobber

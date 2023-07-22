@@ -48,7 +48,7 @@ INCS += -I../include -I../common/ $(OS_INCS)
 # default CFLAGS
 DEFAULT_CFLAGS += -std=gnu99
 DEFAULT_CFLAGS += -Wall
-DEFAULT_CFLAGS += -Werror
+# DEFAULT_CFLAGS += -Werror
 DEFAULT_CFLAGS += -Wmissing-prototypes
 DEFAULT_CFLAGS += -Wpointer-arith
 DEFAULT_CFLAGS += -Wsign-conversion
@@ -177,6 +177,7 @@ ifneq ($(PANGOLIN),1)
 $(error PANGOLIN build not enabled)
 endif
 CFLAGS += -DPANGOLIN_PARITY
+CXXFLAGS += -DPANGOLIN_PARITY
 endif
 
 # enable object checksum with a pangolin build
@@ -185,6 +186,77 @@ ifneq ($(PANGOLIN),1)
 $(error PANGOLIN build not enabled)
 endif
 CFLAGS += -DPANGOLIN_CHECKSUM
+CXXFLAGS += -DPANGOLIN_CHECKSUM
+endif
+
+# enable log-free with a pangolin build
+ifeq ($(PANGOLIN_LOGFREE),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_LOGFREE
+CXXFLAGS += -DPANGOLIN_LOGFREE
+endif
+
+# enable log-free-nofence
+ifeq ($(PANGOLIN_LOGFREE_NOFENCE),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_LOGFREE_NOFENCE
+CXXFLAGS += -DPANGOLIN_LOGFREE_NOFENCE
+endif
+
+# enable PANGOLIN_FORCE_ATOMIC_XOR
+ifeq ($(PANGOLIN_FORCE_ATOMIC_XOR),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_FORCE_ATOMIC_XOR
+CXXFLAGS += -DPANGOLIN_FORCE_ATOMIC_XOR
+endif
+
+# enable pipeline with a pangolin build
+ifeq ($(PANGOLIN_PIPELINE),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_PIPELINE
+CXXFLAGS += -DPANGOLIN_PIPELINE
+endif
+# ...
+ifeq ($(PANGOLIN_PIPELINE_DATA),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_PIPELINE_DATA
+CXXFLAGS += -DPANGOLIN_PIPELINE_DATA
+endif
+#...
+ifeq ($(PANGOLIN_PIPELINE_DATA_2M),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_PIPELINE_DATA_2M
+CXXFLAGS += -DPANGOLIN_PIPELINE_DATA_2M
+endif
+
+# disable all locks for parity updates
+ifeq ($(PANGOLIN_PARITY_NOLOCK),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_PARITY_NOLOCK
+CXXFLAGS += -DPANGOLIN_PARITY_NOLOCK
+endif
+
+# enable AVX512 coding with a pangolin build
+ifeq ($(PANGOLIN_AVX512CODE),1)
+ifneq ($(PANGOLIN),1)
+$(error PANGOLIN build not enabled)
+endif
+CFLAGS += -DPANGOLIN_AVX512CODE
+CXXFLAGS += -DPANGOLIN_AVX512CODE
 endif
 
 CFLAGS += $(EXTRA_CFLAGS)

@@ -77,6 +77,8 @@ GCOV_LDFLAGS=-fprofile-arcs -ftest-coverage
 GCOV_LIBS=-lgcov
 
 LIBS += $(EXTRA_LIBS)
+LIBS += -lisal
+LIBS += -ltcmalloc
 
 ifeq ($(OS_KERNEL_NAME),)
 export OS_KERNEL_NAME := $(shell uname -s)

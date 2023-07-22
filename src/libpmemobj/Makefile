@@ -61,7 +61,7 @@ SOURCE +=\
 	stats.c\
 	ulog.c
 
-SOURCE += objbuf.c objbuf_tx.c pangolin.c
+SOURCE += objbuf.c objbuf_tx.c pangolin.c pangolin_ec.c
 
 include ../Makefile.inc
 
@@ -69,9 +69,13 @@ NASM = nasm
 NASMFLAGS = -f elf64 -F stabs
 
 isa_l:
-	$(NASM) $(NASMFLAGS) xor_gen_sse.asm -o xor_gen_sse.o
-	$(NASM) $(NASMFLAGS) xor_gen_avx.asm -o xor_gen_avx.o
-	$(NASM) $(NASMFLAGS) xor_gen_avx512.asm -o xor_gen_avx512.o
+	$(NASM) $(NASMFLAGS) xor_gen_sse_pgl.asm -o xor_gen_sse_pgl.o
+	$(NASM) $(NASMFLAGS) xor_gen_sse_pipeline_pgl.asm -o xor_gen_sse_pipeline_pgl.o
+	$(NASM) $(NASMFLAGS) xor_gen_avx_pgl.asm -o xor_gen_avx_pgl.o
+	$(NASM) $(NASMFLAGS) xor_gen_avx512_pgl.asm -o xor_gen_avx512_pgl.o
+	$(NASM) $(NASMFLAGS) swap_delta_avx512.asm -o swap_delta_avx512.o
+	$(NASM) $(NASMFLAGS) xor_gen_avx512_pipeline_pgl.asm -o xor_gen_avx512_pipeline_pgl.o
+
 	$(NASM) $(NASMFLAGS) adler32_sse.asm -o adler32_sse.o
 	$(NASM) $(NASMFLAGS) adler32_avx2_4.asm -o adler32_avx2_4.o
 	$(NASM) $(NASMFLAGS) adler32_patch_sse.asm -o adler32_patch_sse.o
@@ -81,15 +85,16 @@ isa_l:
 isa_l_clean:
 	$(RM) -f *.o
 
-ifeq ($(PANGOLIN_PARITY),1)
-OBJS += xor_gen_sse.o xor_gen_avx.o xor_gen_avx512.o
-endif
+# ifeq ($(PANGOLIN_PARITY),1)
+OBJS += xor_gen_sse_pgl.o xor_gen_sse_pipeline_pgl.o xor_gen_avx_pgl.o xor_gen_avx512_pgl.o xor_gen_avx512_pipeline_pgl.o swap_delta_avx512.o
+# endif
 
 ifeq ($(PANGOLIN_CHECKSUM),1)
 OBJS += adler32_sse.o adler32_avx2_4.o adler32_patch_sse.o \
 	adler32_patch_avx2.o crc32_gzip_refl_by8.o
 endif
 
-CFLAGS += -DUSE_LIBDL -D_PMEMOBJ_INTRNL
+CFLAGS += -DUSE_LIBDL -D_PMEMOBJ_INTRNL -mavx512f -mavx -mclwb
+# CFLAGS += -fno-inline -fno-inline-functions  # for debug
 
 LIBS += -pthread -lpmem $(LIBDL) $(LIBNDCTL)
